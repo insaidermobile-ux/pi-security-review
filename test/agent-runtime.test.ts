@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { createAuditSession, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
+import { AGENT_RETRY, createAuditSession, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
 import { mapBounded } from "../extensions/security-review/pool.ts";
 import { checkCommand, createShellTool, ShellRejection } from "../extensions/security-review/shell.ts";
 import { createAffirmTool, createHypothesisTool, createTriageTool, type HypothesisCollector, type TriageCollector } from "../extensions/security-review/submit-tools.ts";
 import type { AffirmArgument } from "../extensions/security-review/schema.ts";
-import { scriptedRuntime, fauxAssistantMessage, fauxToolCall, hang } from "./faux.ts";
+import { failTimes, fauxAssistantMessage, fauxToolCall, hang, providerError, RATE_LIMITED, scriptedRuntime, type ScriptStep } from "./faux.ts";
 import { affirm, hypothesisInput } from "./fixtures.ts";
 import { makeRepo, write } from "./git-fixtures.ts";
 
@@ -182,6 +182,53 @@ describe("triage tool", () => {
 		assert.deepEqual(valid.collector.groups?.[0]?.members, ["C-1", "C-2"]);
 		const empty = await submitTriage([]);
 		assert.deepEqual(empty.collector.groups, []);
+	});
+});
+
+describe("transient provider errors", () => {
+	const FAST_RETRY = { maxRetries: 2, baseDelayMs: 1, maxAgentDelayMs: 1 };
+
+	async function runOnce(step: ScriptStep, options: { timeoutMs?: number; done?: () => boolean } = {}) {
+		const repo = makeRepo();
+		const { runtime, model, calls } = await scriptedRuntime({ "FLAKY-AGENT": [step] });
+		const runner = createSdkAgentRunner({ root: repo, modelRuntime: runtime, timeoutMs: options.timeoutMs ?? 10_000, ledger: new UsageLedger(), retry: FAST_RETRY });
+		const outcome = await runner.run({ label: "hunt:x", role: "hunt", model, systemPrompt: SYSTEM, prompt: "FLAKY-AGENT go", tools: [], done: options.done ?? (() => true) });
+		return { outcome, calls };
+	}
+
+	test("the default budget waits about three minutes in total", () => {
+		const waits = Array.from({ length: AGENT_RETRY.maxRetries }, (_, i) => Math.min(AGENT_RETRY.baseDelayMs * 2 ** i, AGENT_RETRY.maxAgentDelayMs));
+		assert.deepEqual(waits, [5000, 10_000, 20_000, 40_000, 60_000, 60_000]);
+	});
+
+	test("a rate limit within the retry budget is retried and the agent finishes ok", async () => {
+		const { outcome, calls } = await runOnce(failTimes(2, RATE_LIMITED, fauxAssistantMessage("done")));
+		assert.equal(outcome.ok, true, outcome.error);
+		assert.equal(outcome.transient, undefined);
+		assert.equal(calls.length, 3);
+	});
+
+	test("a rate limit that outlasts the budget fails as transient", async () => {
+		const { outcome, calls } = await runOnce(failTimes(99, RATE_LIMITED, fauxAssistantMessage("done")));
+		assert.equal(outcome.ok, false);
+		assert.equal(outcome.transient, true);
+		assert.match(outcome.error!, /Rate limit reached/);
+		assert.equal(calls.length, 1 + FAST_RETRY.maxRetries);
+	});
+
+	test("non-retryable errors, timeouts, and missing submissions are not transient", async () => {
+		for (const message of ["insufficient_quota: You exceeded your current quota", "400 invalid request: unknown parameter"]) {
+			const { outcome, calls } = await runOnce(providerError(message));
+			assert.equal(outcome.ok, false);
+			assert.equal(outcome.transient, undefined, message);
+			assert.equal(calls.length, 1, message);
+		}
+		const timedOut = await runOnce(hang, { timeoutMs: 200 });
+		assert.equal(timedOut.outcome.timedOut, true);
+		assert.equal(timedOut.outcome.transient, undefined);
+		const unsubmitted = await runOnce(fauxAssistantMessage("nothing to report"), { done: () => false });
+		assert.match(unsubmitted.outcome.error!, /without submitting/);
+		assert.equal(unsubmitted.outcome.transient, undefined);
 	});
 });
 

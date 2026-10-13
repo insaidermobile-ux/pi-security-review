@@ -42,6 +42,34 @@ export async function scriptedRuntime(scripts: Record<string, ScriptStep[]>) {
 	return { runtime, faux, model, calls, prompts, root: dir };
 }
 
+/** A provider error response, for example a rate limit. */
+export function providerError(errorMessage: string): AssistantMessage {
+	return fauxAssistantMessage("", { stopReason: "error", errorMessage });
+}
+
+export const RATE_LIMITED = '429: {"code":"1302","message":"Rate limit reached for requests"}';
+
+/**
+ * A step that answers with a provider error for its first `times` calls, then delegates to `then`.
+ * pi drops failed attempts from the conversation it replays, so retries and re-runs hit the same step.
+ */
+export function failTimes(times: number, errorMessage: string, then: ScriptStep): FauxResponseFactory {
+	let calls = 0;
+	return (context, options, state, model) => {
+		if (calls++ < times) return providerError(errorMessage);
+		return typeof then === "function" ? then(context, options, state, model) : then;
+	};
+}
+
+/** A step that answers with `steps` in turn on successive calls, repeating the last one. */
+export function inTurn(...steps: ScriptStep[]): FauxResponseFactory {
+	let calls = 0;
+	return (context, options, state, model) => {
+		const step = steps[Math.min(calls++, steps.length - 1)]!;
+		return typeof step === "function" ? step(context, options, state, model) : step;
+	};
+}
+
 /** A step that never answers until the request is aborted. */
 export const hang: FauxResponseFactory = (_context, options) =>
 	new Promise((resolve) => {

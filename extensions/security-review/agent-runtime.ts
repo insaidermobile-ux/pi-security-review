@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, isRetryableAssistantError, type Model, type Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	createAgentSession,
@@ -86,6 +86,8 @@ export interface AgentOutcome {
 	ok: boolean;
 	timedOut: boolean;
 	error?: string;
+	/** The agent failed on a transient provider error (rate limit, overload, server or network) after its retries. */
+	transient?: true;
 	usage: Usage;
 }
 
@@ -100,7 +102,22 @@ export interface SdkRunnerOptions {
 	thinkingLevel?: ThinkingLevel;
 	timeoutMs: number;
 	ledger: UsageLedger;
+	/** Retry policy for transient model request failures; tests shorten the delays. */
+	retry?: RetryPolicy;
 }
+
+export interface RetryPolicy {
+	maxRetries: number;
+	baseDelayMs: number;
+	maxAgentDelayMs: number;
+}
+
+/**
+ * Waits of 5, 10, 20, 40, 60, and 60 s (about 3 minutes) before an agent gives up on a transient error.
+ * Provider rate limits often last longer than pi's interactive default of 2 + 4 + 8 s, and the total
+ * still fits inside the default agent timeout.
+ */
+export const AGENT_RETRY: RetryPolicy = { maxRetries: 6, baseDelayMs: 5000, maxAgentDelayMs: 60_000 };
 
 function isolatedResources(systemPrompt: string): ResourceLoader {
 	return {
@@ -135,16 +152,18 @@ export async function createAuditSession(options: SdkRunnerOptions, spec: Pick<A
 		tools: [...READ_ONLY_BUILTIN_TOOLS, ...customTools.map((tool) => tool.name)],
 		customTools,
 		sessionManager: SessionManager.inMemory(options.root),
-		settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 3 } }),
+		settingsManager: SettingsManager.inMemory({ retry: { enabled: true, ...(options.retry ?? AGENT_RETRY) } }),
 	});
 	return session;
 }
 
-function lastAssistantError(session: AgentSession): string | undefined {
+function lastAssistantError(session: AgentSession): { error: string; transient: boolean } | undefined {
 	for (let i = session.messages.length - 1; i >= 0; i--) {
 		const message = session.messages[i] as AssistantMessage;
 		if (message?.role !== "assistant") continue;
-		return message.stopReason === "error" ? message.errorMessage || "model request failed" : undefined;
+		if (message.stopReason !== "error") return undefined;
+		// pi's own classifier, so "transient" means exactly what pi already retried.
+		return { error: message.errorMessage || "model request failed", transient: isRetryableAssistantError(message) };
 	}
 	return undefined;
 }
@@ -178,8 +197,8 @@ export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
 
 				if (timedOut) return { label: spec.label, ok: false, timedOut, error: `timed out after ${Math.round(options.timeoutMs / 1000)}s`, usage };
 				if (signal?.aborted) return { label: spec.label, ok: false, timedOut, error: "cancelled", usage };
-				const error = lastAssistantError(session);
-				if (error) return { label: spec.label, ok: false, timedOut, error, usage };
+				const failure = lastAssistantError(session);
+				if (failure) return { label: spec.label, ok: false, timedOut, error: failure.error, ...(failure.transient ? { transient: true as const } : {}), usage };
 				if (!spec.done()) return { label: spec.label, ok: false, timedOut, error: "finished without submitting a result", usage };
 				return { label: spec.label, ok: true, timedOut, usage };
 			} catch (error) {

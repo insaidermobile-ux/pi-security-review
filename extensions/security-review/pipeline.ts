@@ -4,7 +4,7 @@ import type { AgentOutcome, AgentRunner } from "./agent-runtime.ts";
 import { fingerprint, formatTitle, normalizeVulnType } from "./fingerprint.ts";
 import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, type TaggedHypothesis } from "./partition.ts";
 import { mapBounded } from "./pool.ts";
-import { affirmerPrompt, challengerPrompt, huntPrompt, profilePrompt, reportPrompt, systemPrompt, triagePrompt } from "./prompts.ts";
+import { affirmerPrompt, challengerPrompt, type HuntAssignment, huntPrompt, profilePrompt, reportPrompt, systemPrompt, triagePrompt } from "./prompts.ts";
 import { countBySeverity, renderReport, type SeverityCounts } from "./report.ts";
 import {
 	type AffirmArgument,
@@ -165,14 +165,18 @@ export async function huntStage(
 ): Promise<{ verify: Hypothesis[]; overflow: Hypothesis[]; all: Hypothesis[]; failures: string[]; errors: string[] }> {
 	const assignments = huntAssignments(scope);
 	let done = 0;
-	deps.onProgress?.({ stage: "hunt", done, total: assignments.length });
+	let total = assignments.length;
+	deps.onProgress?.({ stage: "hunt", done, total });
 	const perAssignment: TaggedHypothesis[][] = assignments.map(() => []);
+	const outcomes: (AgentOutcome | undefined)[] = assignments.map(() => undefined);
 	const failures: string[] = [];
-	const results = await mapBounded(assignments, deps.settings.maxConcurrentAgents, async (assignment, index) => {
+	const errors: string[] = [];
+
+	const hunt = async (assignment: HuntAssignment, label: string) => {
 		const collector: HypothesisCollector = { hypotheses: [] };
 		const outcome = await deps.runner.run(
 			{
-				label: `hunt:${assignment.label}`,
+				label,
 				role: "hunt",
 				model: deps.models.hunt,
 				systemPrompt: systemPrompt("hunt"),
@@ -183,12 +187,38 @@ export async function huntStage(
 			deps.signal,
 		);
 		agents.push(outcome);
+		deps.onProgress?.({ stage: "hunt", done: ++done, total });
 		// Hypotheses submitted before a failure are schema-valid and still verified.
-		perAssignment[index] = collector.hypotheses.map((h) => ({ ...h, source_partition: assignment.label }));
-		if (!outcome.ok) failures.push(describeFailure(outcome));
-		deps.onProgress?.({ stage: "hunt", done: ++done, total: assignments.length });
+		return { outcome, hypotheses: collector.hypotheses.map((h): TaggedHypothesis => ({ ...h, source_partition: assignment.label })) };
+	};
+
+	const results = await mapBounded(assignments, deps.settings.maxConcurrentAgents, async (assignment, index) => {
+		const attempt = await hunt(assignment, `hunt:${assignment.label}`);
+		perAssignment[index] = attempt.hypotheses;
+		outcomes[index] = attempt.outcome;
 	});
 	for (const result of results) if (result.status === "rejected") failures.push(`hunt: ${String(result.reason)}`);
+
+	// A hunter that failed on a transient provider error (usually a rate limit) is run once more after
+	// the batch, when fewer agents compete for the provider. Losing it would lose its vulnerability class.
+	const rerun = assignments.flatMap((assignment, index) => (outcomes[index]?.transient && !deps.signal?.aborted ? [{ assignment, index }] : []));
+	total += rerun.length;
+	if (rerun.length) deps.onProgress?.({ stage: "hunt", done, total });
+	const rerunResults = await mapBounded(rerun, deps.settings.maxConcurrentAgents, async ({ assignment, index }) => {
+		const first = outcomes[index]!;
+		const retry = await hunt(assignment, `hunt:${assignment.label} (re-run)`);
+		if (retry.outcome.ok) {
+			// The re-run is a complete attempt; keeping the partial one too would add near-duplicates.
+			perAssignment[index] = retry.hypotheses;
+			outcomes[index] = retry.outcome;
+			errors.push(`${first.label} was re-run after a transient error (${first.error})`);
+		} else {
+			perAssignment[index] = [...perAssignment[index]!, ...retry.hypotheses];
+			outcomes[index] = retry.outcome;
+		}
+	});
+	for (const result of rerunResults) if (result.status === "rejected") failures.push(`hunt: ${String(result.reason)}`);
+	for (const outcome of outcomes) if (outcome && !outcome.ok) failures.push(describeFailure(outcome));
 
 	// Partition order, not completion order, so ids are deterministic for the same submissions.
 	const merged = mergeDuplicateHypotheses(perAssignment.flat());
@@ -197,7 +227,8 @@ export async function huntStage(
 	const withIds = [...verify, ...overflow].map(
 		(h, i): Hypothesis => ({ ...h, id: `H-${String(i + 1).padStart(3, "0")}`, fingerprint: fingerprint(h) }),
 	);
-	return { verify: withIds.slice(0, verify.length), overflow: withIds.slice(verify.length), all: withIds, failures, errors: triage.error ? [triage.error] : [] };
+	if (triage.error) errors.push(triage.error);
+	return { verify: withIds.slice(0, verify.length), overflow: withIds.slice(verify.length), all: withIds, failures, errors };
 }
 
 export type VerifyResult =

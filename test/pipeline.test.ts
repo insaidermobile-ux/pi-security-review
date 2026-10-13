@@ -11,7 +11,7 @@ import type { AffirmArgument, Hypothesis, HypothesisInput } from "../extensions/
 import { resolveScope } from "../extensions/security-review/scope.ts";
 import { DEFAULT_SETTINGS, ROLES } from "../extensions/security-review/settings.ts";
 import { loadStore, saveStore } from "../extensions/security-review/store.ts";
-import { fauxAssistantMessage, fauxToolCall, hang, type ScriptStep, scriptedRuntime } from "./faux.ts";
+import { failTimes, fauxAssistantMessage, fauxToolCall, hang, inTurn, providerError, RATE_LIMITED, type ScriptStep, scriptedRuntime } from "./faux.ts";
 import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
 import { makeFixtureRepo, makeRepo, sh } from "./git-fixtures.ts";
 
@@ -41,12 +41,15 @@ const TRAVERSAL: HypothesisInput = hypothesisInput({
 const submit = (tool: string, args: object) => fauxAssistantMessage(fauxToolCall(tool, args as Parameters<typeof fauxToolCall>[1]));
 const say = (text: string) => fauxAssistantMessage(text);
 
+/** One in-session retry with no wait, so a step must fail twice for the agent to fail. */
+const FAST_RETRY = { maxRetries: 1, baseDelayMs: 1, maxAgentDelayMs: 1 };
+
 async function setup(scripts: Record<string, ScriptStep[]>, options: { timeoutMs?: number; settings?: Partial<typeof DEFAULT_SETTINGS> } = {}) {
 	const faux = await scriptedRuntime(scripts);
 	const ledger = new UsageLedger();
 	const progress: Progress[] = [];
 	const makeDeps = (root: string): PipelineDeps => ({
-		runner: createSdkAgentRunner({ root, modelRuntime: faux.runtime, timeoutMs: options.timeoutMs ?? 20_000, ledger }),
+		runner: createSdkAgentRunner({ root, modelRuntime: faux.runtime, timeoutMs: options.timeoutMs ?? 20_000, ledger, retry: FAST_RETRY }),
 		models: Object.fromEntries(ROLES.map((role) => [role, faux.model])) as Record<(typeof ROLES)[number], Model<Api>>,
 		settings: { ...DEFAULT_SETTINGS, ...options.settings },
 		onProgress: (p) => progress.push(p),
@@ -70,6 +73,19 @@ function fixtureScripts(): Record<string, ScriptStep[]> {
 		],
 		"Agent: report": [submit("submit_summary", { summary: "One SQL injection in user search." })],
 	};
+}
+
+const PARTIAL_XSS: HypothesisInput = hypothesisInput({
+	anchors: [{ file: "src/users.js", line: 7, function: "searchUsers" }],
+	claim: "Submitted before the rate limit; the re-run does not repeat it",
+	vuln_type: "xss",
+	suspected_sink: "res.json",
+	severity_estimate: "low",
+});
+
+/** The injection hunter submits a different hypothesis on its first attempt and the SQL injection on its re-run. */
+function rateLimitedInjection(failures: number): ScriptStep[] {
+	return [inTurn(submit("submit_hypothesis", PARTIAL_XSS), submit("submit_hypothesis", SQLI)), failTimes(failures, RATE_LIMITED, say("done"))];
 }
 
 describe("profile stage", () => {
@@ -193,6 +209,34 @@ const RATE_LIMIT: HypothesisInput = hypothesisInput({
 	vuln_type: "missing-rate-limit",
 	suspected_sink: "db.query per request",
 	severity_estimate: "low",
+});
+
+describe("hunt re-runs", () => {
+	test("a re-run that fails again keeps both attempts' hypotheses and records the failure", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup({ "Agent: hunt:injection": rateLimitedInjection(99), "Agent: triage": [submit("submit_triage", { groups: [] })] });
+		const agents: AgentOutcome[] = [];
+		const hunt = await huntStage(await resolveScope(root, "diff"), PROFILE, env.makeDeps(root), agents);
+		assert.deepEqual(hunt.all.map((h) => h.vuln_type).sort(), ["sql-injection", "xss"]);
+		assert.equal(hunt.failures.length, 1);
+		assert.match(hunt.failures[0]!, /^hunt:injection \(re-run\): 429/);
+		assert.deepEqual(hunt.errors, []);
+		assert.deepEqual(agents.filter((a) => a.label.startsWith("hunt:injection")).map((a) => [a.label, a.transient]), [
+			["hunt:injection", true],
+			["hunt:injection (re-run)", true],
+		]);
+	});
+
+	test("timeouts and non-transient errors are not re-run", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup({ "Agent: hunt:network-ssrf": [hang], "Agent: hunt:injection": [providerError("insufficient_quota: quota exceeded")] }, { timeoutMs: 1500 });
+		const agents: AgentOutcome[] = [];
+		const hunt = await huntStage(await resolveScope(root, "diff"), PROFILE, env.makeDeps(root), agents);
+		assert.equal(agents.some((a) => a.label.includes("re-run")), false);
+		assert.equal(agents.length, VULN_CLASSES.length);
+		assert.deepEqual(hunt.failures.map((f) => f.split(":").slice(0, 2).join(":")).sort(), ["hunt:injection", "hunt:network-ssrf"]);
+		assert.deepEqual(env.progress.at(-1), { stage: "hunt", done: 6, total: 6 });
+	});
 });
 
 describe("triage groups", () => {
@@ -457,6 +501,26 @@ describe("end-to-end with scripted model responses", () => {
 		assert.equal(result.findings.length, 1);
 		assert.equal(result.refuted.length, 1);
 		assert.match(readFileSync(result.reportPath, "utf8"), /Incomplete run/);
+	});
+
+	test("a rate-limited hunt agent is re-run after the others and the run stays complete", async () => {
+		const root = makeFixtureRepo();
+		const scripts = fixtureScripts();
+		// Fails the first attempt and its one in-session retry; the re-run succeeds.
+		scripts["Agent: hunt:injection"] = rateLimitedInjection(1 + FAST_RETRY.maxRetries);
+		const env = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(result.run.complete, true, result.run.incomplete_reasons.join("; "));
+		assert.deepEqual(result.hypotheses.map((h) => h.vuln_type), ["sql-injection", "path-traversal"], "the re-run replaces the partial attempt");
+		assert.equal(result.findings[0]!.vuln_type, "sql-injection");
+		assert.match(result.run.errors.join("\n"), /hunt:injection was re-run after a transient error \(429: .*Rate limit reached/);
+		assert.match(readFileSync(result.reportPath, "utf8"), /## Errors\n\n- hunt:injection was re-run/);
+
+		const labels = (JSON.parse(readFileSync(result.runLogPath, "utf8")) as { agents: AgentOutcome[] }).agents.map((a) => `${a.label}:${a.ok}`);
+		const rerun = labels.indexOf("hunt:injection (re-run):true");
+		assert.ok(labels.includes("hunt:injection:false"), labels.join(", "));
+		assert.ok(rerun > Math.max(...labels.map((l, i) => (l.startsWith("hunt:") && !l.includes("re-run") ? i : -1))), "re-run starts after the batch");
+		assert.deepEqual(env.progress.filter((p) => p.stage === "hunt").at(-1), { stage: "hunt", done: 7, total: 7 });
 	});
 
 	test("an invalid store stops the run before any model call", async () => {
