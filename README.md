@@ -1,8 +1,54 @@
 # pi-security-review
 
-Adversarial, multi-agent security review for [pi](https://pi.dev). Run `/security-review` in a pi session and the extension audits your unmerged changes (or the whole project) for exploitable vulnerabilities, then tries hard to refute every candidate before reporting it.
+Adversarial, multi-agent security review for [pi](https://pi.dev).
+
+[![npm version](https://img.shields.io/npm/v/@insaidermobile-ux/pi-security-review)](https://www.npmjs.com/package/@insaidermobile-ux/pi-security-review)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node.js >=22.18](https://img.shields.io/badge/node-%3E%3D22.18-green.svg)](https://nodejs.org/)
+
+Run `/security-review` in a pi session to audit your unmerged changes or whole project for exploitable vulnerabilities, with independent verification before reporting.
+
+![Security review summary posted into a pi session after a run](docs/report-summary.png)
 
 Inspired by Claude Code's `/security-review` and by the affirmer/challenger verification in [VulnHunter](https://github.com/Clouditera/VulnHunter).
+
+## Why pi-security-review?
+
+- **Adversarial verification:** an affirmer builds the attack path, then an independent challenger tries to refute it.
+- **Read-only, confined agents:** inspection tools stay inside the project; agents cannot modify the audited code.
+- **Persistent findings:** a deduplicated store preserves your decisions across runs.
+- **Per-role models:** choose different models for hunting, verification, and reporting.
+- **Diff or full mode:** review unmerged changes or the whole project.
+
+## Quick start
+
+Requires Node.js 22.18 or later and pi 1.1 or later.
+
+```bash
+pi install npm:@insaidermobile-ux/pi-security-review
+```
+
+Then run this inside a pi session in a git repository:
+
+```text
+/security-review
+```
+
+### Git and local installation
+
+```bash
+# from GitHub
+pi install git:github.com/insaidermobile-ux/pi-security-review
+
+# from a local checkout
+pi install ./pi-security-review
+
+# project-local install (writes .pi/settings.json instead of your user settings)
+pi install -l ./pi-security-review
+
+# try it for one session without installing
+pi -e ./pi-security-review
+```
 
 ## How it works
 
@@ -25,24 +71,6 @@ Inspired by Claude Code's `/security-review` and by the affirmer/challenger veri
 6. **report**: writes `report.md` and merges findings into `findings.json`, then one agent writes a short summary for the report, and the command posts the result into the session.
 
 Agents submit results through schema-validated tools, so every finding has anchors, a severity, a confidence, and both verification arguments.
-
-## Install
-
-Requires pi 1.1 or later.
-
-```bash
-# from GitHub
-pi install git:github.com/insaidermobile-ux/pi-security-review
-
-# from a local checkout
-pi install ./pi-security-review
-
-# project-local install (writes .pi/settings.json instead of your user settings)
-pi install -l ./pi-security-review
-
-# try it for one session without installing
-pi -e ./pi-security-review
-```
 
 ## Usage
 
@@ -140,3 +168,7 @@ SR_KEEP_TEMP=1 node -e 'import("./test/git-fixtures.ts").then((m) => console.log
 ```
 
 Role prompts are in `roles/`. The fixture under `test/fixtures/vulnerable-app` is deliberately vulnerable; exclude `test/fixtures` when running `/security-review full` on this repository.
+
+## License
+
+[MIT](LICENSE) © insaidermobile-ux.
