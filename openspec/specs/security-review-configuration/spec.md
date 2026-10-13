@@ -28,6 +28,17 @@ The extension SHALL accept a per-role model override in its settings, using the 
 - **WHEN** a role override names a model that pi cannot resolve
 - **THEN** the command stops before auditing and reports which role's override is invalid
 
+### Requirement: Roles can use models served by pi-claude-bridge
+When a role's model is served by the `claude-bridge` provider and the bridge is installed, each audit agent of that role SHALL register its system prompt with the bridge before its requests, so that the bridge accepts them. The registered prompt SHALL carry only the role's instructions, without project context files or skills. Agents on other providers SHALL be unaffected.
+
+#### Scenario: Session model served by the bridge
+- **WHEN** the session model is a `claude-bridge` model and no role overrides are configured
+- **THEN** every audit agent's request is accepted by the bridge and the run completes
+
+#### Scenario: Bridge not installed
+- **WHEN** a role uses a model from another provider
+- **THEN** no prompt is registered and the agent runs as before
+
 ### Requirement: Exclude patterns narrow the scope
 The extension SHALL accept a list of glob patterns in its settings. Files matching any pattern SHALL be removed from the audited file set in both default and full modes.
 
