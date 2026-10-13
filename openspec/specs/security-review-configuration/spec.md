@@ -7,11 +7,15 @@ Defines the user-tunable settings of the security review extension: model select
 ## Requirements
 
 ### Requirement: Session model is the default for every role
-When no override is configured, every agent role (profile, hunt, affirmer, challenger, report) SHALL use the model active in the user's pi session at the time the command is invoked.
+When no override is configured, every agent role (profile, hunt, triage, affirmer, challenger, report) SHALL use the model active in the user's pi session at the time the command is invoked.
 
 #### Scenario: No overrides configured
 - **WHEN** the user runs `/security-review` with the session model set to a given provider and model
 - **THEN** all audit agents are created with that same model
+
+#### Scenario: Triage role override
+- **WHEN** settings specify a model for the `triage` role
+- **THEN** the triage agent uses that model and the setting is accepted as a known role
 
 ### Requirement: Model can be overridden per role
 The extension SHALL accept a per-role model override in its settings, using the `provider/model` form. A role with an override SHALL use that model; roles without one SHALL use the session model.
