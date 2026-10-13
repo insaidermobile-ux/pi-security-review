@@ -10,6 +10,7 @@ import {
 	SettingsManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { BRIDGE_PROVIDER, recordBridgePrompt } from "./bridge.ts";
 import type { Role } from "./settings.ts";
 import { createShellTool } from "./shell.ts";
 
@@ -185,7 +186,12 @@ export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
 			try {
 				if (signal?.aborted) return { label: spec.label, ok: false, timedOut: false, error: "cancelled", usage };
 				session = await createAuditSession(options, spec);
+				const audit = session;
+				const bridged = spec.model.provider === BRIDGE_PROVIDER;
+				// Re-recorded on every turn, as the bridge does itself, in case pi re-renders the prompt.
+				const register = () => bridged && recordBridgePrompt(audit.systemPrompt, spec.systemPrompt);
 				session.subscribe((event) => {
+					if (event.type === "turn_start") register();
 					if (event.type !== "message_end" || event.message.role !== "assistant") return;
 					const message = event.message as AssistantMessage;
 					if (!message.usage) return;
@@ -198,9 +204,13 @@ export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
 					void session?.abort();
 				}, options.timeoutMs);
 
+				register();
 				await session.prompt(spec.prompt);
 				// A model error already used up pi's retries; a nudge would only repeat the failing request.
-				if (!spec.done() && !timedOut && !signal?.aborted && spec.nudge && !lastAssistantError(session)) await session.prompt(spec.nudge);
+				if (!spec.done() && !timedOut && !signal?.aborted && spec.nudge && !lastAssistantError(session)) {
+					register();
+					await session.prompt(spec.nudge);
+				}
 
 				if (timedOut) return { label: spec.label, ok: false, timedOut, error: `timed out after ${Math.round(options.timeoutMs / 1000)}s`, usage };
 				if (signal?.aborted) return { label: spec.label, ok: false, timedOut, error: "cancelled", usage };

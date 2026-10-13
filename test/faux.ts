@@ -17,11 +17,12 @@ function textOf(message: Message): string {
  * found in an agent's first user message selects its script, and the number of assistant turns so far
  * selects the step. Agents can therefore run in parallel deterministically.
  */
-export async function scriptedRuntime(scripts: Record<string, ScriptStep[]>) {
+export async function scriptedRuntime(scripts: Record<string, ScriptStep[]>, options: { provider?: string } = {}) {
+	const provider = options.provider ?? "faux";
 	const dir = tempDir("sr-faux-");
 	const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
 	const cost = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 };
-	const faux = fauxProvider({ provider: "faux", models: [{ id: "auditor", cost }, { id: "other-auditor", cost }] });
+	const faux = fauxProvider({ provider, models: [{ id: "auditor", cost }, { id: "other-auditor", cost }] });
 	runtime.registerNativeProvider(faux.provider);
 	const calls: string[] = [];
 	/** First user message of each scripted agent, by script key. */
@@ -39,9 +40,9 @@ export async function scriptedRuntime(scripts: Record<string, ScriptStep[]>) {
 		return typeof step === "function" ? step(context, options, state, model) : step;
 	};
 	faux.setResponses(Array.from({ length: 2000 }, () => router));
-	const model = runtime.getModel("faux", "auditor")!;
+	const model = runtime.getModel(provider, "auditor")!;
 	/** A second model on the same provider, for per-role overrides. */
-	const otherModel = runtime.getModel("faux", "other-auditor")!;
+	const otherModel = runtime.getModel(provider, "other-auditor")!;
 	return { runtime, faux, model, otherModel, calls, prompts, root: dir };
 }
 
