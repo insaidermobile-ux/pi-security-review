@@ -149,6 +149,21 @@ describe("hunt partitioning", () => {
 		assert.ok(groups.some((g) => g.label.startsWith("src/api/")), groups.map((g) => g.label).join(", "));
 	});
 
+	test("full mode splits through directory levels that have a single child", () => {
+		const maven = Array.from({ length: 1900 }, (_, i) => `src/main/java/com/acme/app/mod${i % 30}/File${i}.java`);
+		const groups = subtreePartitions([...maven, "pom.xml", "README.md"]);
+		assert.ok(groups.length > 1 && groups.length <= 12, `${groups.length} groups`);
+		assert.ok(Math.max(...groups.map((g) => g.files.length)) <= 400, groups.map((g) => `${g.label}:${g.files.length}`).join(", "));
+		assert.deepEqual(groups.flatMap((g) => g.files).sort(), [...maven, "pom.xml", "README.md"].sort());
+
+		const angular = Array.from({ length: 900 }, (_, i) => `src/app/feature${i % 20}/c${i}.ts`);
+		assert.ok(subtreePartitions(angular).length > 1);
+
+		// Files in a single directory cannot be split further.
+		const flat = Array.from({ length: 400 }, (_, i) => `a/b/c/f${i}.ts`);
+		assert.deepEqual(subtreePartitions(flat).map((g) => g.files.length), [400]);
+	});
+
 	test("full mode on a small project uses one subtree agent", async () => {
 		const scope = await resolveScope(makeFixtureRepo(), "full");
 		const assignments = huntAssignments(scope);

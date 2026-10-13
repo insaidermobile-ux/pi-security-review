@@ -1,12 +1,14 @@
 import { normalizeVulnType } from "./fingerprint.ts";
 import { type HuntAssignment, VULN_CLASSES } from "./prompts.ts";
-import type { Anchor, Consequence, HypothesisInput } from "./schema.ts";
+import { type Anchor, type Consequence, type HypothesisInput, type Severity, severityRank } from "./schema.ts";
 import type { Scope } from "./scope.ts";
 
 /** Upper bound of hunt agents in full mode; concurrency is limited separately. */
 export const MAX_SUBTREE_AGENTS = 12;
 /** Preferred maximum number of files owned by one full-mode hunt agent. */
 export const TARGET_FILES_PER_AGENT = 150;
+/** How many times a subtree is split into its subdirectories before it is left as one group. */
+const MAX_SPLIT_LEVELS = 6;
 
 export function huntAssignments(scope: Scope): HuntAssignment[] {
 	if (scope.mode === "diff") {
@@ -33,22 +35,32 @@ function groupByPrefix(files: readonly string[], depth: number): Group[] {
 }
 
 /**
+ * The subdirectories of a group whose files share their first `depth` path segments. Levels with a
+ * single subdirectory are passed through, as in `src/main/java/com/acme`, so they neither stop the
+ * split nor count as one. Undefined when all the files are in one directory.
+ */
+function splitGroup(files: readonly string[], depth: number): { children: Group[]; depth: number } | undefined {
+	let deepest = 0;
+	for (const file of files) deepest = Math.max(deepest, file.split("/").length);
+	for (let next = depth + 1; next <= deepest; next++) {
+		const children = groupByPrefix(files, next);
+		if (children.length > 1) return { children, depth: next };
+	}
+	return undefined;
+}
+
+/**
  * Split the project into subtrees: top-level directories, recursively split while they hold more than
  * the target number of files, then small groups merged until at most MAX_SUBTREE_AGENTS remain.
  */
 export function subtreePartitions(files: readonly string[]): Group[] {
 	let groups: Group[] = [];
-	const queue: Array<{ group: Group; depth: number }> = groupByPrefix(files, 1).map((group) => ({ group, depth: 1 }));
+	const queue: Array<{ group: Group; depth: number; level: number }> = groupByPrefix(files, 1).map((group) => ({ group, depth: 1, level: 1 }));
 	while (queue.length > 0) {
-		const { group, depth } = queue.shift()!;
-		if (group.files.length > TARGET_FILES_PER_AGENT && depth < 6) {
-			const children = groupByPrefix(group.files, depth + 1);
-			if (children.length > 1) {
-				queue.push(...children.map((child) => ({ group: child, depth: depth + 1 })));
-				continue;
-			}
-		}
-		groups.push(group);
+		const { group, depth, level } = queue.shift()!;
+		const split = group.files.length > TARGET_FILES_PER_AGENT && level < MAX_SPLIT_LEVELS ? splitGroup(group.files, depth) : undefined;
+		if (split) queue.push(...split.children.map((child) => ({ group: child, depth: split.depth, level: level + 1 })));
+		else groups.push(group);
 	}
 	// Merge the two smallest groups while there are too many, or while both are small enough to share an agent.
 	groups.sort((a, b) => a.files.length - b.files.length);
@@ -74,8 +86,6 @@ function anchorsOverlap(a: readonly Anchor[], b: readonly Anchor[]): boolean {
 	);
 }
 
-const SEVERITY_ORDER = ["critical", "high", "medium", "low"];
-
 /** Merge hypotheses with the same vulnerability type and overlapping anchors, keeping the more severe claim. */
 export function mergeDuplicateHypotheses(hypotheses: readonly TaggedHypothesis[]): TaggedHypothesis[] {
 	const merged: TaggedHypothesis[] = [];
@@ -86,7 +96,7 @@ export function mergeDuplicateHypotheses(hypotheses: readonly TaggedHypothesis[]
 			merged.push({ ...hypothesis, anchors: [...hypothesis.anchors] });
 			continue;
 		}
-		const keepIncoming = SEVERITY_ORDER.indexOf(hypothesis.severity_estimate) < SEVERITY_ORDER.indexOf(match.severity_estimate);
+		const keepIncoming = severityRank(hypothesis.severity_estimate) < severityRank(match.severity_estimate);
 		const anchors = [...(keepIncoming ? hypothesis.anchors : match.anchors), ...(keepIncoming ? match.anchors : hypothesis.anchors)];
 		const unique = anchors.filter((anchor, i) => anchors.findIndex((other) => other.file === anchor.file && other.line === anchor.line) === i);
 		const partitions = new Set([...match.source_partition.split(", "), hypothesis.source_partition]);
@@ -127,7 +137,7 @@ export function applyTriageGroups(candidates: readonly TaggedHypothesis[], group
 		if (group) {
 			const [primary, ...others] = group.map((i) => candidates[i]!);
 			const members = [primary!, ...others];
-			const severity = members.map((m) => m.severity_estimate).sort((a, b) => SEVERITY_ORDER.indexOf(a) - SEVERITY_ORDER.indexOf(b))[0]!;
+			const severity = members.map((m) => m.severity_estimate).sort((a, b) => severityRank(a) - severityRank(b))[0]!;
 			const partitions = new Set(members.flatMap((m) => m.source_partition.split(", ")));
 			const consequences: Consequence[] = [
 				...(primary!.consequences ?? []),
@@ -142,10 +152,10 @@ export function applyTriageGroups(candidates: readonly TaggedHypothesis[], group
 }
 
 /** Order by severity estimate (stable) and split at the cap. */
-export function applyHypothesisCap<T extends { severity_estimate: string }>(hypotheses: readonly T[], cap: number): { verify: T[]; overflow: T[] } {
+export function applyHypothesisCap<T extends { severity_estimate: Severity }>(hypotheses: readonly T[], cap: number): { verify: T[]; overflow: T[] } {
 	const ordered = hypotheses
 		.map((hypothesis, index) => ({ hypothesis, index }))
-		.sort((a, b) => SEVERITY_ORDER.indexOf(a.hypothesis.severity_estimate) - SEVERITY_ORDER.indexOf(b.hypothesis.severity_estimate) || a.index - b.index)
+		.sort((a, b) => severityRank(a.hypothesis.severity_estimate) - severityRank(b.hypothesis.severity_estimate) || a.index - b.index)
 		.map((entry) => entry.hypothesis);
 	return { verify: ordered.slice(0, cap), overflow: ordered.slice(cap) };
 }
