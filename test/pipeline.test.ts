@@ -707,4 +707,16 @@ describe("end-to-end with scripted model responses", () => {
 		assert.match(readFileSync(result.reportPath, "utf8"), /Incomplete run:\*\* the review was cancelled/);
 		assert.doesNotMatch(result.run.errors.join("\n"), /summary unavailable/);
 	});
+
+	test("a vulnerability type in another script is recorded as a finding", async () => {
+		const root = makeFixtureRepo();
+		const scripts = fixtureScripts();
+		scripts["Agent: hunt:injection"] = [submit("submit_hypothesis", { ...SQLI, vuln_type: "SQL-инъекция" }), say("done")];
+		scripts["Agent: hunt:access-control"] = [say("nothing")];
+		const env = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(result.run.complete, true, result.run.incomplete_reasons.join("; "));
+		assert.deepEqual(result.run.errors, []);
+		assert.deepEqual(result.findings.map((f) => f.vuln_type), ["sql-инъекция"]);
+	});
 });

@@ -1,26 +1,30 @@
 import { createHash } from "node:crypto";
 import type { Anchor } from "./schema.ts";
 
-const VULN_TYPE_ALIASES: Record<string, string> = {
-	sqli: "sql-injection",
-	"sql-injection-attack": "sql-injection",
-	"os-command-injection": "command-injection",
-	"shell-injection": "command-injection",
-	"directory-traversal": "path-traversal",
-	"cross-site-scripting": "xss",
-	"server-side-request-forgery": "ssrf",
-	"broken-access-control": "missing-authz",
-	"missing-authorization": "missing-authz",
-	"insecure-direct-object-reference": "idor",
-};
+const VULN_TYPE_ALIASES = new Map([
+	["sqli", "sql-injection"],
+	["sql-injection-attack", "sql-injection"],
+	["os-command-injection", "command-injection"],
+	["shell-injection", "command-injection"],
+	["directory-traversal", "path-traversal"],
+	["cross-site-scripting", "xss"],
+	["server-side-request-forgery", "ssrf"],
+	["broken-access-control", "missing-authz"],
+	["missing-authorization", "missing-authz"],
+	["insecure-direct-object-reference", "idor"],
+]);
 
-/** Canonical vulnerability type: lowercase words joined by dashes, with common synonyms folded. */
+/**
+ * Canonical vulnerability type: lowercase words joined by dashes, with common synonyms folded. Letters
+ * of any script are kept, because agents answer in the language of the session. The result is never
+ * empty, which a finding's type must not be.
+ */
 export function normalizeVulnType(vulnType: string): string {
 	const canonical = vulnType
 		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/[^\p{L}\p{N}]+/gu, "-")
 		.replace(/^-+|-+$/g, "");
-	return VULN_TYPE_ALIASES[canonical] ?? canonical;
+	return VULN_TYPE_ALIASES.get(canonical) ?? (canonical || "unknown");
 }
 
 const IDENTIFIER = /[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/g;

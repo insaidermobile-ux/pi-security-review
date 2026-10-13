@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { fingerprint, formatTitle, normalizeSink } from "../extensions/security-review/fingerprint.ts";
+import { fingerprint, formatTitle, normalizeSink, normalizeVulnType } from "../extensions/security-review/fingerprint.ts";
 import { AffirmArgument, ChallengeArgument, Finding, HypothesisInput, ProfileInput, StoreFile, validate } from "../extensions/security-review/schema.ts";
 import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
 
@@ -112,6 +112,15 @@ describe("fingerprint", () => {
 	test("normalizes vulnerability type spelling", () => {
 		const a = hypothesisInput();
 		assert.equal(fingerprint(a), fingerprint({ ...a, vuln_type: "SQL Injection" }));
+	});
+
+	test("keeps vulnerability types in any script and never yields an empty or inherited one", () => {
+		assert.equal(normalizeVulnType("SQL-инъекция"), "sql-инъекция");
+		assert.equal(normalizeVulnType("  Обход авторизации! "), "обход-авторизации");
+		assert.equal(normalizeVulnType("注入"), "注入");
+		assert.equal(normalizeVulnType("!!!"), "unknown");
+		assert.equal(normalizeVulnType("constructor"), "constructor");
+		assert.equal(normalizeVulnType("Cross Site Scripting"), "xss");
 	});
 });
 
