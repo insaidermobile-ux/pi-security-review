@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { join, posix } from "node:path";
+import { join } from "node:path";
 import type { ScopeMode } from "./schema.ts";
 
 /** The extension's own output directory; never part of the audited scope. */
@@ -63,6 +63,9 @@ async function gitOk(cwd: string, args: string[], what: string): Promise<string>
 	return result.stdout;
 }
 
+/** Before a subcommand that takes file names: `pages/[id].tsx` is a file, not a glob that also matches `pages/i.tsx`. */
+const LITERAL_PATHS = "--literal-pathspecs";
+
 function splitZ(output: string): string[] {
 	return output.split("\0").filter((entry) => entry.length > 0);
 }
@@ -97,17 +100,58 @@ export async function resolveBaseRef(root: string): Promise<string> {
 	);
 }
 
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Whether `file` matches an exclude pattern. A pattern without a slash also matches by basename at any
- * depth, and a pattern naming a directory matches everything below it.
+ * Regular expression source for a glob. Unlike a shell glob, `*`, `?`, and `**` also match names that
+ * start with a dot, so an excluded directory does not leak its dotfiles into the audited scope.
  */
-export function isExcluded(file: string, patterns: readonly string[]): boolean {
-	for (const raw of patterns) {
-		const pattern = raw.replace(/^\.\//, "").replace(/\/+$/, "");
-		if (posix.matchesGlob(file, pattern) || posix.matchesGlob(file, `${pattern}/**`)) return true;
-		if (!pattern.includes("/") && (posix.matchesGlob(file, `**/${pattern}`) || posix.matchesGlob(file, `**/${pattern}/**`))) return true;
+function globSource(glob: string): string {
+	let source = "";
+	for (let i = 0; i < glob.length; i++) {
+		const char = glob[i]!;
+		const close = char === "[" ? glob.indexOf("]", i + 2) : char === "{" ? glob.indexOf("}", i) : -1;
+		if (char === "*" && glob[i + 1] === "*") {
+			// "**/" spans any number of directories, including none.
+			const spansDirectories = glob[i + 2] === "/";
+			source += spansDirectories ? "(?:.*/)?" : ".*";
+			i += spansDirectories ? 2 : 1;
+		} else if (char === "*") source += "[^/]*";
+		else if (char === "?") source += "[^/]";
+		else if (char === "[" && close > 0) {
+			const body = glob.slice(i + 1, close);
+			source += `[${body.startsWith("!") ? `^${body.slice(1)}` : body}]`.replace(/\\/g, "\\\\");
+			i = close;
+		} else if (char === "{" && close > 0) {
+			source += `(?:${glob.slice(i + 1, close).split(",").map(globSource).join("|")})`;
+			i = close;
+		} else source += escapeRegExp(char);
 	}
-	return false;
+	return source;
+}
+
+/**
+ * A predicate for the exclude patterns. A pattern without a slash also matches by name at any depth,
+ * and a pattern naming a directory matches everything below it.
+ */
+export function excludeMatcher(patterns: readonly string[]): (file: string) => boolean {
+	const matchers = patterns.map((raw) => {
+		const pattern = raw.replace(/^\.\//, "").replace(/\/+$/, "");
+		const anyDepth = pattern.includes("/") ? "" : "(?:.*/)?";
+		try {
+			return new RegExp(`^${anyDepth}${globSource(pattern)}(?:/.*)?$`);
+		} catch {
+			// Not a valid glob, for example an unordered character range: match the text as written.
+			return new RegExp(`^${anyDepth}${escapeRegExp(pattern)}(?:/.*)?$`);
+		}
+	});
+	return (file) => matchers.some((matcher) => matcher.test(file));
+}
+
+export function isExcluded(file: string, patterns: readonly string[]): boolean {
+	return excludeMatcher(patterns)(file);
 }
 
 function isAuditableFile(root: string, file: string): boolean {
@@ -121,8 +165,8 @@ function isAuditableFile(root: string, file: string): boolean {
 }
 
 function finalize(root: string, files: Iterable<string>, exclude: readonly string[]): string[] {
-	const excluded = [...exclude, `${STORE_DIR}/**`];
-	return [...new Set(files)].filter((file) => !isExcluded(file, excluded) && isAuditableFile(root, file)).sort();
+	const excluded = excludeMatcher([...exclude, `${STORE_DIR}/**`]);
+	return [...new Set(files)].filter((file) => !excluded(file) && isAuditableFile(root, file)).sort();
 }
 
 export interface ResolveScopeOptions {
@@ -161,13 +205,15 @@ export async function resolveScope(cwd: string, mode: ScopeMode, options: Resolv
 			`There are no unmerged changes against ${baseRef}: no commits, uncommitted edits, or untracked files to audit. Run /security-review full to audit the whole project.`,
 		);
 	}
-	const untracked = untrackedListed.filter((file) => files.includes(file));
-	const trackedInScope = files.filter((file) => !untracked.includes(file));
+	const inScope = new Set(files);
+	const untracked = untrackedListed.filter((file) => inScope.has(file));
+	const untrackedInScope = new Set(untracked);
+	const trackedInScope = files.filter((file) => !untrackedInScope.has(file));
 	let diff = "";
 	if (trackedInScope.length > 0) {
 		// Very long pathspecs can exceed argument limits; the unfiltered diff is an acceptable fallback.
 		const pathspec = trackedInScope.length <= 500 ? ["--", ...trackedInScope] : [];
-		diff = await gitOk(root, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", mergeBase, ...pathspec], "Reading the diff");
+		diff = await gitOk(root, [LITERAL_PATHS, "diff", "--no-ext-diff", "--no-textconv", "--no-color", mergeBase, ...pathspec], "Reading the diff");
 	}
 	const diffTruncated = Buffer.byteLength(diff) > MAX_DIFF_BYTES;
 	if (diffTruncated) diff = Buffer.from(diff).subarray(0, MAX_DIFF_BYTES).toString();
@@ -181,7 +227,7 @@ export async function resolveScope(cwd: string, mode: ScopeMode, options: Resolv
 export async function introducedIn(scope: Scope, file: string): Promise<string | undefined> {
 	if (scope.mode !== "diff" || !scope.mergeBase) return undefined;
 	if (scope.untracked?.includes(file)) return "uncommitted";
-	const log = await git(scope.root, ["log", "-n", "1", "--format=%H", `${scope.mergeBase}..HEAD`, "--", file]);
+	const log = await git(scope.root, [LITERAL_PATHS, "log", "-n", "1", "--format=%H", `${scope.mergeBase}..HEAD`, "--", file]);
 	const sha = log.stdout.trim();
 	if (log.code === 0 && sha) return sha;
 	return scope.files.includes(file) ? "uncommitted" : undefined;

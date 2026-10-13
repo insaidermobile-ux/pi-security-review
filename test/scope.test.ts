@@ -123,6 +123,39 @@ describe("isExcluded", () => {
 		assert.ok(isExcluded("pkg/node_modules/x/index.js", ["node_modules"]));
 		assert.ok(isExcluded("web/app.min.js", ["*.min.js"]));
 		assert.ok(!isExcluded("src/vendors.ts", ["vendor"]));
+		assert.ok(isExcluded("src/a.test.ts", ["*.{test,spec}.ts"]));
+		assert.ok(isExcluded("src/a1.ts", ["src/a[0-9].ts"]));
+		assert.ok(!isExcluded("src/ab.ts", ["src/a[0-9].ts"]));
+		assert.ok(isExcluded("docs/api/x.md", ["docs/**/*.md"]));
+		assert.ok(isExcluded("docs/x.md", ["docs/**/*.md"]));
+		assert.ok(!isExcluded("docs/x.md", ["src/*.md"]));
+		assert.ok(!isExcluded("a/b/c.ts", ["a/*.ts"]));
+		assert.ok(isExcluded("a+b/c.ts", ["a+b"]));
+	});
+
+	test("excluded directories and name patterns also cover dotfiles", () => {
+		assert.ok(isExcluded("vendor/.hidden/x.js", ["vendor"]));
+		assert.ok(isExcluded("vendor/pkg/.eslintrc.js", ["vendor/**"]));
+		assert.ok(isExcluded("a/.cache/x.min.js", ["*.min.js"]));
+		assert.ok(isExcluded("docs/.vitepress/config.ts", ["docs"]));
+		assert.ok(isExcluded(".github/workflows/ci.yml", ["*.yml"]));
+	});
+});
+
+describe("literal paths", () => {
+	test("a file name with glob characters does not pull in other files", async () => {
+		const root = makeRepo({ "pages/i.tsx": "1\n", "pages/[id].tsx": "1\n" });
+		sh(root, "checkout", "-q", "-b", "feature");
+		write(root, "pages/i.tsx", "export const other = 2;\n");
+		commitAll(root, "change i");
+		const sha = sh(root, "rev-parse", "HEAD").trim();
+		write(root, "pages/[id].tsx", "export const dynamic = 3;\n");
+		const scope = await resolveScope(root, "diff", { exclude: ["pages/i.tsx"] });
+		assert.deepEqual(scope.files, ["pages/[id].tsx"]);
+		assert.match(scope.diff!, /dynamic = 3/);
+		assert.doesNotMatch(scope.diff!, /other = 2/);
+		assert.equal(await introducedIn(scope, "pages/[id].tsx"), "uncommitted");
+		assert.notEqual(await introducedIn(scope, "pages/[id].tsx"), sha);
 	});
 });
 
