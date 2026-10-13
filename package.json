@@ -2,6 +2,16 @@
   "name": "pi-security-review",
   "version": "0.1.0",
   "description": "Adversarial multi-agent security review for pi: /security-review audits your branch or whole project with affirmer/challenger verification.",
+  "license": "MIT",
+  "author": "insaidermobile-ux",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/insaidermobile-ux/pi-security-review.git"
+  },
+  "homepage": "https://github.com/insaidermobile-ux/pi-security-review#readme",
+  "bugs": {
+    "url": "https://github.com/insaidermobile-ux/pi-security-review/issues"
+  },
   "type": "module",
   "keywords": [
     "pi-package",
@@ -13,7 +23,8 @@
   "files": [
     "extensions",
     "roles",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": [

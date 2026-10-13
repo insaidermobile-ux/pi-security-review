@@ -4,3 +4,7 @@ dist/
 coverage/
 .security-review/
 .DS_Store
+
+# local OpenSpec workflow files
+.pi/
+openspec/

@@ -32,7 +32,7 @@ Requires pi 1.1 or later.
 
 ```bash
 # from GitHub
-pi install git:github.com/<owner>/pi-security-review
+pi install git:github.com/insaidermobile-ux/pi-security-review
 
 # from a local checkout
 pi install ./pi-security-review
