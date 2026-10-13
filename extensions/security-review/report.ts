@@ -89,7 +89,7 @@ function renderFinding(finding: Finding): string {
 	return lines.join("\n");
 }
 
-function plural(count: number, one: string, many: string): string {
+export function plural(count: number, one: string, many = `${one}s`): string {
 	return `${count} ${count === 1 ? one : many}`;
 }
 
@@ -103,7 +103,7 @@ export function renderReport(input: ReportInput): string {
 		"",
 		`- Run: \`${run.id}\` (${run.started_at} to ${run.finished_at})`,
 		`- Scope: ${scope.mode === "diff" ? `changes against \`${scope.baseRef}\` (merge-base \`${scope.mergeBase?.slice(0, 12)}\`)` : "full project"}, ${run.files} files`,
-		`- Result: ${plural(vulnerabilities, "vulnerability", "vulnerabilities")}, ${plural(findings.length - vulnerabilities, "risk", "risks")}, ${input.refuted.length} refuted, ${input.unverified.length} unverified`,
+		`- Result: ${plural(vulnerabilities, "vulnerability", "vulnerabilities")}, ${plural(findings.length - vulnerabilities, "risk")}, ${input.refuted.length} refuted, ${input.unverified.length} unverified`,
 		`- By severity: ${SEVERITIES.map((s) => `${counts[s]} ${s}`).join(", ")}`,
 	];
 	if (!run.complete) lines.push(`- **Incomplete run:** ${run.incomplete_reasons.join("; ")}`);
