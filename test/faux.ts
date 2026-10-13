@@ -20,7 +20,8 @@ function textOf(message: Message): string {
 export async function scriptedRuntime(scripts: Record<string, ScriptStep[]>) {
 	const dir = tempDir("sr-faux-");
 	const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
-	const faux = fauxProvider({ provider: "faux", models: [{ id: "auditor", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }] });
+	const cost = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 };
+	const faux = fauxProvider({ provider: "faux", models: [{ id: "auditor", cost }, { id: "other-auditor", cost }] });
 	runtime.registerNativeProvider(faux.provider);
 	const calls: string[] = [];
 	/** First user message of each scripted agent, by script key. */
@@ -39,7 +40,9 @@ export async function scriptedRuntime(scripts: Record<string, ScriptStep[]>) {
 	};
 	faux.setResponses(Array.from({ length: 2000 }, () => router));
 	const model = runtime.getModel("faux", "auditor")!;
-	return { runtime, faux, model, calls, prompts, root: dir };
+	/** A second model on the same provider, for per-role overrides. */
+	const otherModel = runtime.getModel("faux", "other-auditor")!;
+	return { runtime, faux, model, otherModel, calls, prompts, root: dir };
 }
 
 /** A provider error response, for example a rate limit. */

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { AgentOutcome, AgentRunner } from "./agent-runtime.ts";
+import { type AgentOutcome, type AgentRunner, emptyUsage } from "./agent-runtime.ts";
 import { fingerprint, formatTitle, normalizeVulnType } from "./fingerprint.ts";
 import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, type TaggedHypothesis } from "./partition.ts";
 import { mapBounded } from "./pool.ts";
@@ -91,8 +91,46 @@ function describeFailure(outcome: AgentOutcome): string {
 	return `${outcome.label}: ${outcome.error ?? "failed"}`;
 }
 
+function sameModel(a: Model<Api>, b: Model<Api>): boolean {
+	return a.provider === b.provider && a.id === b.id;
+}
+
+/** A failed outcome for work that threw instead of returning one. */
+function thrown(label: string, reason: unknown): AgentOutcome {
+	return { label, ok: false, timedOut: false, error: String(reason), usage: emptyUsage() };
+}
+
+const MAX_REASON_LABEL = 60;
+const MAX_REASON_ERROR = 300;
+const MAX_REASON_LABELS = 3;
+
+function shorten(text: string, max: number): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	return flat.length <= max ? flat : `${flat.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * Incomplete-run reasons for a stage's failed agents, one per distinct error, in first-seen order.
+ * A provider that refuses every request would otherwise repeat the same long error once per agent;
+ * the run log keeps each agent's full error.
+ */
+export function failureReasons(stage: string, failed: AgentOutcome[]): string[] {
+	const groups = new Map<string, string[]>();
+	for (const outcome of failed) {
+		const error = outcome.error ?? "failed";
+		groups.set(error, [...(groups.get(error) ?? []), outcome.label]);
+	}
+	return [...groups].map(([error, labels]) => {
+		const shown = labels.slice(0, MAX_REASON_LABELS).map((label) => shorten(label, MAX_REASON_LABEL));
+		const more = labels.length - shown.length;
+		const message = shorten(error, MAX_REASON_ERROR);
+		if (labels.length === 1) return `${stage} agent failed (${shown[0]}: ${message})`;
+		return `${labels.length} ${stage} agents failed (${shown.join(", ")}${more ? ` and ${more} more` : ""}): ${message}`;
+	});
+}
+
 /** Profile stage: reuse the cached profile in diff mode when the project fingerprint matches. */
-export async function profileStage(scope: Scope, deps: PipelineDeps, agents: AgentOutcome[]): Promise<{ profile?: Profile; cached: boolean; failure?: string }> {
+export async function profileStage(scope: Scope, deps: PipelineDeps, agents: AgentOutcome[]): Promise<{ profile?: Profile; cached: boolean; failure?: AgentOutcome }> {
 	const projectFp = await projectFingerprint(scope.root);
 	if (scope.mode === "diff") {
 		const cached = loadCachedProfile(scope.root, projectFp);
@@ -119,9 +157,9 @@ export async function profileStage(scope: Scope, deps: PipelineDeps, agents: Age
 	agents.push(outcome);
 	if (collector.profile) {
 		saveProfile(scope.root, projectFp, collector.profile, (deps.now ?? (() => new Date()))().toISOString());
-		return { profile: collector.profile, cached: false, failure: outcome.ok ? undefined : describeFailure(outcome) };
+		return { profile: collector.profile, cached: false, failure: outcome.ok ? undefined : outcome };
 	}
-	return { cached: false, failure: describeFailure(outcome) };
+	return { cached: false, failure: outcome };
 }
 
 /**
@@ -162,14 +200,14 @@ export async function huntStage(
 	profile: Profile | undefined,
 	deps: PipelineDeps,
 	agents: AgentOutcome[],
-): Promise<{ verify: Hypothesis[]; overflow: Hypothesis[]; all: Hypothesis[]; failures: string[]; errors: string[] }> {
+): Promise<{ verify: Hypothesis[]; overflow: Hypothesis[]; all: Hypothesis[]; failures: AgentOutcome[]; errors: string[] }> {
 	const assignments = huntAssignments(scope);
 	let done = 0;
 	let total = assignments.length;
 	deps.onProgress?.({ stage: "hunt", done, total });
 	const perAssignment: TaggedHypothesis[][] = assignments.map(() => []);
 	const outcomes: (AgentOutcome | undefined)[] = assignments.map(() => undefined);
-	const failures: string[] = [];
+	const failures: AgentOutcome[] = [];
 	const errors: string[] = [];
 
 	const hunt = async (assignment: HuntAssignment, label: string) => {
@@ -197,7 +235,7 @@ export async function huntStage(
 		perAssignment[index] = attempt.hypotheses;
 		outcomes[index] = attempt.outcome;
 	});
-	for (const result of results) if (result.status === "rejected") failures.push(`hunt: ${String(result.reason)}`);
+	for (const result of results) if (result.status === "rejected") failures.push(thrown("hunt", result.reason));
 
 	// A hunter that failed on a transient provider error (usually a rate limit) is run once more after
 	// the batch, when fewer agents compete for the provider. Losing it would lose its vulnerability class.
@@ -217,8 +255,8 @@ export async function huntStage(
 			outcomes[index] = retry.outcome;
 		}
 	});
-	for (const result of rerunResults) if (result.status === "rejected") failures.push(`hunt: ${String(result.reason)}`);
-	for (const outcome of outcomes) if (outcome && !outcome.ok) failures.push(describeFailure(outcome));
+	for (const result of rerunResults) if (result.status === "rejected") failures.push(thrown("hunt", result.reason));
+	for (const outcome of outcomes) if (outcome && !outcome.ok) failures.push(outcome);
 
 	// Partition order, not completion order, so ids are deterministic for the same submissions.
 	const merged = mergeDuplicateHypotheses(perAssignment.flat());
@@ -234,7 +272,7 @@ export async function huntStage(
 export type VerifyResult =
 	| { kind: "finding"; hypothesis: Hypothesis; finding: NewFinding }
 	| { kind: "refuted"; hypothesis: Hypothesis; refuted: RefutedHypothesis }
-	| { kind: "unverified"; hypothesis: Hypothesis; reason: string }
+	| { kind: "unverified"; hypothesis: Hypothesis; failure: AgentOutcome }
 	| { kind: "invalid"; hypothesis: Hypothesis; reason: string };
 
 export async function buildFinding(scope: Scope, hypothesis: Hypothesis, affirm: AffirmArgument, challenge: ChallengeArgument): Promise<NewFinding> {
@@ -288,7 +326,7 @@ export async function verifyHypothesis(
 	);
 	agents.push(affirmOutcome);
 	const affirm = affirmCollector.argument;
-	if (!affirm) return { kind: "unverified", hypothesis, reason: describeFailure(affirmOutcome) };
+	if (!affirm) return { kind: "unverified", hypothesis, failure: affirmOutcome };
 
 	const challengeCollector: ArgumentCollector<ChallengeArgument> = {};
 	const challengeOutcome = await deps.runner.run(
@@ -306,7 +344,7 @@ export async function verifyHypothesis(
 	);
 	agents.push(challengeOutcome);
 	const challenge = challengeCollector.argument;
-	if (!challenge) return { kind: "unverified", hypothesis, reason: describeFailure(challengeOutcome) };
+	if (!challenge) return { kind: "unverified", hypothesis, failure: challengeOutcome };
 
 	if (challenge.verdict === "refuted") return { kind: "refuted", hypothesis, refuted: { hypothesis, affirmer: affirm, challenger: challenge } };
 	const finding = await buildFinding(scope, hypothesis, affirm, challenge);
@@ -331,7 +369,7 @@ export async function verifyStage(
 		return result;
 	});
 	return results.map((result, i) =>
-		result.status === "fulfilled" ? result.value : { kind: "unverified", hypothesis: hypotheses[i]!, reason: `${hypotheses[i]!.id}: ${String(result.reason)}` },
+		result.status === "fulfilled" ? result.value : { kind: "unverified", hypothesis: hypotheses[i]!, failure: thrown(hypotheses[i]!.id, result.reason) },
 	);
 }
 
@@ -347,10 +385,14 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	const errors: string[] = [];
 
 	const profileResult = await profileStage(scope, deps, agents);
-	if (profileResult.failure) incomplete.push(`profile agent failed (${profileResult.failure})`);
+	if (profileResult.failure) incomplete.push(...failureReasons("profile", [profileResult.failure]));
 
-	const hunt = await huntStage(scope, profileResult.profile, deps, agents);
-	if (hunt.failures.length) incomplete.push(...hunt.failures.map((f) => `hunt agent failed (${f})`));
+	// The profile agent is the first model request. If the provider refused it outright, every hunt agent
+	// on the same model would be refused too, so do not start them.
+	const refused = profileResult.failure?.rejected && sameModel(deps.models.profile, deps.models.hunt);
+	if (refused) incomplete.push(`hunting skipped: ${deps.models.hunt.provider}/${deps.models.hunt.id} rejected the profile agent's request`);
+	const hunt = refused ? { verify: [], overflow: [], all: [], failures: [], errors: [] } : await huntStage(scope, profileResult.profile, deps, agents);
+	incomplete.push(...failureReasons("hunt", hunt.failures));
 	// Triage failure loses no coverage: it is an error, not a reason the run is incomplete.
 	errors.push(...hunt.errors);
 	if (hunt.overflow.length) incomplete.push(`${hunt.overflow.length} hypotheses over the cap of ${deps.settings.maxHypotheses} were not verified`);
@@ -360,14 +402,16 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	const newFindings: NewFinding[] = [];
 	const refuted: RefutedHypothesis[] = [];
 	const unverified: Hypothesis[] = [...hunt.overflow];
+	const verifyFailures: AgentOutcome[] = [];
 	for (const result of verified) {
 		if (result.kind === "finding") newFindings.push(result.finding);
 		else if (result.kind === "refuted") refuted.push(result.refuted);
 		else if (result.kind === "unverified") {
 			unverified.push(result.hypothesis);
-			incomplete.push(`verification failed (${result.reason})`);
+			verifyFailures.push(result.failure);
 		} else errors.push(result.reason);
 	}
+	incomplete.push(...failureReasons("verification", verifyFailures));
 
 	deps.onProgress?.({ stage: "report" });
 	const finished = now();
@@ -440,7 +484,7 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 			...(result.kind === "finding" ? { verdict: result.finding.verification.verdict } : {}),
 			...(priors.get(result.hypothesis.id) ? { prior_false_positive: priors.get(result.hypothesis.id)!.id } : {}),
 		})),
-		agents: agents.map(({ label, ok, timedOut, error, usage }) => ({ label, ok, timedOut, error, usage })),
+		agents: agents.map(({ label, ok, timedOut, error, transient, rejected, usage }) => ({ label, ok, timedOut, error, transient, rejected, usage })),
 		summary,
 	});
 

@@ -216,19 +216,43 @@ describe("transient provider errors", () => {
 		assert.equal(calls.length, 1 + FAST_RETRY.maxRetries);
 	});
 
-	test("non-retryable errors, timeouts, and missing submissions are not transient", async () => {
-		for (const message of ["insufficient_quota: You exceeded your current quota", "400 invalid request: unknown parameter"]) {
+	test("a failed model request is not followed by a nudge", async () => {
+		const repo = makeRepo();
+		const { runtime, model, calls } = await scriptedRuntime({ "FLAKY-AGENT": [providerError("401 invalid api key"), fauxAssistantMessage("nudged")] });
+		const runner = createSdkAgentRunner({ root: repo, modelRuntime: runtime, timeoutMs: 10_000, ledger: new UsageLedger(), retry: FAST_RETRY });
+		const spec = { label: "profile", role: "profile" as const, model, systemPrompt: SYSTEM, prompt: "FLAKY-AGENT go", tools: [], done: () => false, nudge: "Submit now." };
+		const outcome = await runner.run(spec);
+		assert.equal(outcome.error, "401 invalid api key");
+		assert.equal(outcome.rejected, true);
+		assert.deepEqual(calls, ["FLAKY-AGENT#0"]);
+	});
+
+	test("non-retryable provider errors are rejected, not transient", async () => {
+		for (const message of ["insufficient_quota: You exceeded your current quota", "400 invalid request: unknown parameter", "prompt-capture: no capture for this 3719-char system prompt"]) {
 			const { outcome, calls } = await runOnce(providerError(message));
 			assert.equal(outcome.ok, false);
 			assert.equal(outcome.transient, undefined, message);
+			assert.equal(outcome.rejected, true, message);
 			assert.equal(calls.length, 1, message);
 		}
+	});
+
+	test("rate limits, context overflow, timeouts, and missing submissions are not rejected", async () => {
+		const limited = await runOnce(failTimes(99, RATE_LIMITED, fauxAssistantMessage("done")));
+		assert.equal(limited.outcome.rejected, undefined);
+		// pi handles context overflow itself and drops the error from the conversation.
+		const overflow = await runOnce(providerError("prompt is too long: 250000 tokens > 200000 maximum"), { done: () => false });
+		assert.equal(overflow.outcome.ok, false);
+		assert.equal(overflow.outcome.rejected, undefined);
+		assert.equal(overflow.outcome.transient, undefined);
 		const timedOut = await runOnce(hang, { timeoutMs: 200 });
 		assert.equal(timedOut.outcome.timedOut, true);
 		assert.equal(timedOut.outcome.transient, undefined);
+		assert.equal(timedOut.outcome.rejected, undefined);
 		const unsubmitted = await runOnce(fauxAssistantMessage("nothing to report"), { done: () => false });
 		assert.match(unsubmitted.outcome.error!, /without submitting/);
 		assert.equal(unsubmitted.outcome.transient, undefined);
+		assert.equal(unsubmitted.outcome.rejected, undefined);
 	});
 });
 

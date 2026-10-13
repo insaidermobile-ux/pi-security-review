@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { type AgentOutcome, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
+import { type AgentOutcome, createSdkAgentRunner, emptyUsage, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
 import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, subtreePartitions } from "../extensions/security-review/partition.ts";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
-import { huntStage, type PipelineDeps, profileStage, type Progress, runPipeline, verifyHypothesis } from "../extensions/security-review/pipeline.ts";
+import { failureReasons, huntStage, type PipelineDeps, profileStage, type Progress, runPipeline, verifyHypothesis } from "../extensions/security-review/pipeline.ts";
 import { VULN_CLASSES } from "../extensions/security-review/prompts.ts";
 import type { AffirmArgument, Hypothesis, HypothesisInput } from "../extensions/security-review/schema.ts";
 import { resolveScope } from "../extensions/security-review/scope.ts";
@@ -44,13 +44,19 @@ const say = (text: string) => fauxAssistantMessage(text);
 /** One in-session retry with no wait, so a step must fail twice for the agent to fail. */
 const FAST_RETRY = { maxRetries: 1, baseDelayMs: 1, maxAgentDelayMs: 1 };
 
-async function setup(scripts: Record<string, ScriptStep[]>, options: { timeoutMs?: number; settings?: Partial<typeof DEFAULT_SETTINGS> } = {}) {
+async function setup(
+	scripts: Record<string, ScriptStep[]>,
+	options: { timeoutMs?: number; settings?: Partial<typeof DEFAULT_SETTINGS>; otherHuntModel?: boolean } = {},
+) {
 	const faux = await scriptedRuntime(scripts);
 	const ledger = new UsageLedger();
 	const progress: Progress[] = [];
 	const makeDeps = (root: string): PipelineDeps => ({
 		runner: createSdkAgentRunner({ root, modelRuntime: faux.runtime, timeoutMs: options.timeoutMs ?? 20_000, ledger, retry: FAST_RETRY }),
-		models: Object.fromEntries(ROLES.map((role) => [role, faux.model])) as Record<(typeof ROLES)[number], Model<Api>>,
+		models: Object.fromEntries(ROLES.map((role) => [role, role === "hunt" && options.otherHuntModel ? faux.otherModel : faux.model])) as Record<
+			(typeof ROLES)[number],
+			Model<Api>
+		>,
 		settings: { ...DEFAULT_SETTINGS, ...options.settings },
 		onProgress: (p) => progress.push(p),
 	});
@@ -219,7 +225,8 @@ describe("hunt re-runs", () => {
 		const hunt = await huntStage(await resolveScope(root, "diff"), PROFILE, env.makeDeps(root), agents);
 		assert.deepEqual(hunt.all.map((h) => h.vuln_type).sort(), ["sql-injection", "xss"]);
 		assert.equal(hunt.failures.length, 1);
-		assert.match(hunt.failures[0]!, /^hunt:injection \(re-run\): 429/);
+		assert.equal(hunt.failures[0]!.label, "hunt:injection (re-run)");
+		assert.match(hunt.failures[0]!.error!, /^429/);
 		assert.deepEqual(hunt.errors, []);
 		assert.deepEqual(agents.filter((a) => a.label.startsWith("hunt:injection")).map((a) => [a.label, a.transient]), [
 			["hunt:injection", true],
@@ -234,8 +241,40 @@ describe("hunt re-runs", () => {
 		const hunt = await huntStage(await resolveScope(root, "diff"), PROFILE, env.makeDeps(root), agents);
 		assert.equal(agents.some((a) => a.label.includes("re-run")), false);
 		assert.equal(agents.length, VULN_CLASSES.length);
-		assert.deepEqual(hunt.failures.map((f) => f.split(":").slice(0, 2).join(":")).sort(), ["hunt:injection", "hunt:network-ssrf"]);
+		assert.deepEqual(hunt.failures.map((f) => f.label).sort(), ["hunt:injection", "hunt:network-ssrf"]);
 		assert.deepEqual(env.progress.at(-1), { stage: "hunt", done: 6, total: 6 });
+	});
+});
+
+describe("failure reasons", () => {
+	const failed = (label: string, error: string): AgentOutcome => ({ label, ok: false, timedOut: false, error, usage: emptyUsage() });
+
+	test("one failure names the agent and its error", () => {
+		assert.deepEqual(failureReasons("profile", [failed("profile", "timed out after 600s")]), ["profile agent failed (profile: timed out after 600s)"]);
+		assert.deepEqual(failureReasons("hunt", []), []);
+	});
+
+	test("identical failures collapse into one reason with at most three labels", () => {
+		const labels = ["hunt:a", "hunt:b", "hunt:c", "hunt:d", "hunt:e", "hunt:f"];
+		assert.deepEqual(failureReasons("hunt", labels.map((l) => failed(l, "refused"))), ["6 hunt agents failed (hunt:a, hunt:b, hunt:c and 3 more): refused"]);
+		assert.deepEqual(failureReasons("hunt", labels.slice(0, 2).map((l) => failed(l, "refused"))), ["2 hunt agents failed (hunt:a, hunt:b): refused"]);
+	});
+
+	test("different errors stay separate, in first-seen order", () => {
+		const reasons = failureReasons("verification", [failed("affirmer:H-001", "x"), failed("challenger:H-002", "y"), failed("affirmer:H-003", "x")]);
+		assert.deepEqual(reasons, ["2 verification agents failed (affirmer:H-001, affirmer:H-003): x", "verification agent failed (challenger:H-002: y)"]);
+	});
+
+	test("long labels and errors are shortened", () => {
+		const label = `hunt:${Array.from({ length: 12 }, (_, i) => `core/crates/c${i}`).join(" + ")}`;
+		const error = `prompt-capture: ${"no capture for this prompt. ".repeat(40)}`;
+		const [reason] = failureReasons("hunt", [failed(label, error), failed("hunt:app", error)]);
+		const [labels, message] = [reason!.slice(reason!.indexOf("(") + 1, reason!.indexOf("):")), reason!.slice(reason!.indexOf("): ") + 3)];
+		assert.ok(message.length <= 300 && message.length > 280, `${message.length} chars`);
+		assert.ok(message.endsWith("…"));
+		assert.ok(labels.split(", ")[0]!.length <= 60);
+		assert.ok(labels.split(", ")[0]!.endsWith("…"));
+		assert.ok(reason!.length < 420, `${reason!.length} chars`);
 	});
 });
 
@@ -521,6 +560,36 @@ describe("end-to-end with scripted model responses", () => {
 		assert.ok(labels.includes("hunt:injection:false"), labels.join(", "));
 		assert.ok(rerun > Math.max(...labels.map((l, i) => (l.startsWith("hunt:") && !l.includes("re-run") ? i : -1))), "re-run starts after the batch");
 		assert.deepEqual(env.progress.filter((p) => p.stage === "hunt").at(-1), { stage: "hunt", done: 7, total: 7 });
+	});
+
+	test("a refused profile request stops the run before hunting", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup({ "Agent: profile": [providerError("prompt-capture: no capture for this 2669-char system prompt")] });
+		const result = await runPipeline(await resolveScope(root, "full"), env.makeDeps(root));
+		assert.deepEqual(result.run.incomplete_reasons, [
+			"profile agent failed (profile: prompt-capture: no capture for this 2669-char system prompt)",
+			"hunting skipped: faux/auditor rejected the profile agent's request",
+		]);
+		assert.deepEqual(env.calls, ["Agent: profile#0"]);
+		const log = JSON.parse(readFileSync(result.runLogPath, "utf8")) as { agents: AgentOutcome[] };
+		assert.deepEqual(log.agents.map((a) => [a.label, a.rejected]), [["profile", true]]);
+		assert.match(readFileSync(result.reportPath, "utf8"), /Incomplete run:\*\* profile agent failed .*; hunting skipped: faux\/auditor/);
+		assert.equal(env.progress.some((p) => p.stage === "hunt"), false);
+	});
+
+	test("a refused profile request does not stop hunting on another model, and a timed-out one never does", async () => {
+		const refused = await setup({ ...fixtureScripts(), "Agent: profile": [providerError("401 invalid api key")] }, { otherHuntModel: true });
+		const root = makeFixtureRepo();
+		const withOtherModel = await runPipeline(await resolveScope(root, "diff"), refused.makeDeps(root));
+		assert.ok(withOtherModel.hypotheses.length > 0);
+		assert.ok(!withOtherModel.run.incomplete_reasons.some((r) => r.startsWith("hunting skipped")));
+
+		const slow = await setup({ ...fixtureScripts(), "Agent: profile": [hang] }, { timeoutMs: 1500 });
+		const other = makeFixtureRepo();
+		const timedOut = await runPipeline(await resolveScope(other, "diff"), slow.makeDeps(other));
+		assert.ok(timedOut.run.incomplete_reasons[0]!.startsWith("profile agent failed (profile: timed out"));
+		assert.ok(!timedOut.run.incomplete_reasons.some((r) => r.startsWith("hunting skipped")));
+		assert.ok(slow.calls.some((c) => c.startsWith("Agent: hunt:")));
 	});
 
 	test("an invalid store stops the run before any model call", async () => {

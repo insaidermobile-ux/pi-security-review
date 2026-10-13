@@ -1,4 +1,4 @@
-import { type Api, type AssistantMessage, isRetryableAssistantError, type Model, type Usage } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, isContextOverflow, isRetryableAssistantError, type Model, type Usage } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	createAgentSession,
@@ -88,6 +88,11 @@ export interface AgentOutcome {
 	error?: string;
 	/** The agent failed on a transient provider error (rate limit, overload, server or network) after its retries. */
 	transient?: true;
+	/**
+	 * The provider rejected the request with an error retrying cannot fix (authentication, billing, a refusal).
+	 * Context overflow is excluded: it depends on the prompt, not on the model alone.
+	 */
+	rejected?: true;
 	usage: Usage;
 }
 
@@ -157,13 +162,14 @@ export async function createAuditSession(options: SdkRunnerOptions, spec: Pick<A
 	return session;
 }
 
-function lastAssistantError(session: AgentSession): { error: string; transient: boolean } | undefined {
+function lastAssistantError(session: AgentSession): { error: string; transient: boolean; rejected: boolean } | undefined {
 	for (let i = session.messages.length - 1; i >= 0; i--) {
 		const message = session.messages[i] as AssistantMessage;
 		if (message?.role !== "assistant") continue;
 		if (message.stopReason !== "error") return undefined;
 		// pi's own classifier, so "transient" means exactly what pi already retried.
-		return { error: message.errorMessage || "model request failed", transient: isRetryableAssistantError(message) };
+		const transient = isRetryableAssistantError(message);
+		return { error: message.errorMessage || "model request failed", transient, rejected: !transient && !isContextOverflow(message) };
 	}
 	return undefined;
 }
@@ -193,12 +199,16 @@ export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
 				}, options.timeoutMs);
 
 				await session.prompt(spec.prompt);
-				if (!spec.done() && !timedOut && !signal?.aborted && spec.nudge) await session.prompt(spec.nudge);
+				// A model error already used up pi's retries; a nudge would only repeat the failing request.
+				if (!spec.done() && !timedOut && !signal?.aborted && spec.nudge && !lastAssistantError(session)) await session.prompt(spec.nudge);
 
 				if (timedOut) return { label: spec.label, ok: false, timedOut, error: `timed out after ${Math.round(options.timeoutMs / 1000)}s`, usage };
 				if (signal?.aborted) return { label: spec.label, ok: false, timedOut, error: "cancelled", usage };
 				const failure = lastAssistantError(session);
-				if (failure) return { label: spec.label, ok: false, timedOut, error: failure.error, ...(failure.transient ? { transient: true as const } : {}), usage };
+				if (failure) {
+					const kind = failure.transient ? { transient: true as const } : failure.rejected ? { rejected: true as const } : {};
+					return { label: spec.label, ok: false, timedOut, error: failure.error, ...kind, usage };
+				}
 				if (!spec.done()) return { label: spec.label, ok: false, timedOut, error: "finished without submitting a result", usage };
 				return { label: spec.label, ok: true, timedOut, usage };
 			} catch (error) {
