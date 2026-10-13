@@ -54,6 +54,7 @@ describe("verification prompts with consequences", () => {
 
 	test("role prompts explain how to treat consequences", () => {
 		assert.match(systemPrompt("affirmer"), /lists consequences/);
+		assert.match(systemPrompt("affirmer"), /do not repeat it or name the technique in the consequence/);
 		assert.match(systemPrompt("challenger"), /consequences fall with it/);
 	});
 });
