@@ -273,6 +273,27 @@ describe("mergeRun fallback matching", () => {
 		assert.equal("consequences" in cleared.findings[0]!, false);
 	});
 
+	test("re-observation without CWE or CVSS clears the old values but keeps introduced_in and user fields", () => {
+		const first = mergeRun(emptyStore(), {
+			run: run("diff"),
+			findings: [newFinding({ cwe: "CWE-89", cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", cvss_score: 7.5, introduced_in: "abc123" })],
+			now: "t1",
+		}).store;
+		(first.findings[0] as Finding & { note?: string }).note = "tracked in JIRA-1";
+		const incoming = newFinding();
+		delete incoming.cwe;
+		delete incoming.cvss_vector;
+		delete incoming.cvss_score;
+		delete incoming.introduced_in;
+		const second = mergeRun(first, { run: run("diff", "run-2"), findings: [incoming], now: "t2" }).store.findings[0]!;
+		for (const field of ["cwe", "cvss_vector", "cvss_score"]) assert.equal(field in second, false, field);
+		assert.equal(second.introduced_in, "abc123");
+		assert.equal((second as Finding & { note?: string }).note, "tracked in JIRA-1");
+		const third = mergeRun({ ...emptyStore(), findings: [second] }, { run: run("diff", "run-3"), findings: [newFinding({ cwe: "CWE-200", cvss_score: 5.3 })], now: "t3" }).store.findings[0]!;
+		assert.equal(third.cwe, "CWE-200");
+		assert.equal(third.cvss_score, 5.3);
+	});
+
 	test("an ambiguous observation becomes a new finding", () => {
 		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [authz({ line: 10, fn: "listUsers" }), authz({ line: 30, fn: "deleteUser" })], now: "t1" }).store;
 		const { store, added } = mergeRun(first, { run: run("diff", "run-2"), findings: [authz({ line: 50, fn: "exportUsers" })], now: "t2" });

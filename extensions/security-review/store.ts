@@ -160,6 +160,13 @@ export function staleMarkingSkipped(run: Pick<RunRecord, "mode" | "complete">): 
 	return run.mode === "full" && !run.complete;
 }
 
+/**
+ * Optional fields that describe one observation. A re-observation without them clears the old values,
+ * so CWE, CVSS, and consequences always come from the same verification as the rest of the record.
+ * `introduced_in` is not listed: the first known introducing commit is kept.
+ */
+const OBSERVATION_OPTIONAL_FIELDS = ["cwe", "cvss_vector", "cvss_score", "consequences"] as const satisfies readonly (keyof Finding)[];
+
 function nextId(findings: readonly Finding[]): () => string {
 	let max = 0;
 	for (const finding of findings) max = Math.max(max, Number.parseInt(finding.id.slice(3), 10) || 0);
@@ -193,8 +200,7 @@ export function mergeRun(previous: StoreFile, input: MergeInput): MergeResult {
 				introduced_in: existing.introduced_in ?? incoming.introduced_in,
 			});
 			if (existing.introduced_in === undefined) delete existing.introduced_in;
-			// Consequences describe this observation; an observation without them clears the old list.
-			if (!incoming.consequences) delete existing.consequences;
+			for (const field of OBSERVATION_OPTIONAL_FIELDS) if (incoming[field] === undefined) delete existing[field];
 			if (!observed.has(existing.id)) updated++;
 			observed.set(existing.id, existing);
 		} else {
