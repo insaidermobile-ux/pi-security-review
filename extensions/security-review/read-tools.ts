@@ -1,6 +1,6 @@
-import { constants, realpathSync } from "node:fs";
+import { constants, lstatSync, realpathSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
 	createFindToolDefinition,
 	createGrepToolDefinition,
@@ -16,18 +16,36 @@ function escapes(from: string, to: string): boolean {
 }
 
 /**
+ * The real path of `path` or, when nothing exists there, of its nearest existing ancestor. Undefined at
+ * a symbolic link that does not resolve: where it leads is unknown.
+ */
+function realLocation(path: string): string | undefined {
+	for (let current = path; ; current = dirname(current)) {
+		try {
+			return realpathSync(current);
+		} catch {
+			try {
+				lstatSync(current);
+				return undefined;
+			} catch {}
+			if (dirname(current) === current) return current;
+		}
+	}
+}
+
+/**
  * Whether `path` (absolute, or relative to `root`) stays inside the project, both as written and after
- * symbolic links are resolved: a repository can contain a link that points at a file outside it.
+ * symbolic links are resolved: a repository can contain a link that points at a file outside it. A path
+ * that does not exist is judged by its nearest existing ancestor, and a link that does not resolve is
+ * refused, so a missing file behind a link is refused like an existing one: the answer does not reveal
+ * whether a file outside the project exists.
  */
 export function isInsideProject(root: string, path: string): boolean {
 	const resolved = resolve(root, path);
 	if (escapes(root, resolved)) return false;
-	try {
-		return !escapes(realpathSync(root), realpathSync(resolved));
-	} catch {
-		// Nothing exists at the path, so nothing can be read through it.
-		return true;
-	}
+	const realRoot = realLocation(root);
+	const real = realLocation(resolved);
+	return realRoot !== undefined && real !== undefined && !escapes(realRoot, real);
 }
 
 export function outsideProjectMessage(path: string): string {

@@ -8,7 +8,7 @@ import { type ScopeMode, SEVERITIES, severityRank } from "./schema.ts";
 import { resolveScope, ScopeError } from "./scope.ts";
 import { resolveRoleModels, resolveSettings } from "./settings.ts";
 import { readSettingsLayers } from "./settings-source.ts";
-import { plural, STALE_SKIPPED_NOTE } from "./report.ts";
+import { plural, STALE_SKIPPED_NOTE, stripControl } from "./report.ts";
 import { StoreError, staleMarkingSkipped } from "./store.ts";
 
 export const COMMAND_NAME = "security-review";
@@ -63,6 +63,16 @@ function orderedFindings(result: RunResult) {
 	return [...result.findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.id.localeCompare(b.id));
 }
 
+/**
+ * Agent-written text for the Markdown summary. pi renders a Markdown link as a terminal hyperlink that
+ * shows only its text, so an agent could disguise where it points. Inline and reference links both need
+ * `](` or `]:`, which are split by a space; bare URLs still show themselves. Control characters are
+ * removed from the whole summary.
+ */
+function linkFree(text: string): string {
+	return text.replace(/\]([(:])/g, "] $1");
+}
+
 /** Markdown summary shown to the user after a run. It quotes audit agents, so it is never sent to the session's model. */
 export function formatSummary(result: RunResult, cwd: string, usage: string): string {
 	const rel = (path: string) => relative(cwd, path) || path;
@@ -85,16 +95,16 @@ export function formatSummary(result: RunResult, cwd: string, usage: string): st
 			const triaged = finding.status !== "open" ? ` (${finding.status})` : "";
 			const count = finding.consequences?.length ?? 0;
 			const consequences = count ? ` (+${plural(count, "consequence")})` : "";
-			lines.push(`- ${finding.id} [${finding.severity} ${finding.finding_class}] ${finding.title} - \`${anchor.file}:${anchor.line}\`${consequences}${triaged}`);
+			lines.push(`- ${finding.id} [${finding.severity} ${finding.finding_class}] ${linkFree(finding.title)} - \`${anchor.file}:${anchor.line}\`${consequences}${triaged}`);
 		}
 		if (ordered.length > MAX_LISTED_FINDINGS) lines.push(`- ... and ${ordered.length - MAX_LISTED_FINDINGS} more in the report`);
 	}
-	if (result.summary) lines.push("", result.summary.trim());
-	if (!result.run.complete) lines.push("", `**Incomplete run:** ${result.run.incomplete_reasons.join("; ")}`);
+	if (result.summary) lines.push("", linkFree(result.summary.trim()));
+	if (!result.run.complete) lines.push("", `**Incomplete run:** ${linkFree(result.run.incomplete_reasons.join("; "))}`);
 	if (staleMarkingSkipped(result.run)) lines.push(STALE_SKIPPED_NOTE);
 	lines.push("", `Report: \`${rel(result.reportPath)}\` · Findings: \`${rel(result.storePath)}\``, `Usage: ${usage}.`);
 	if (result.gitignoreHint) lines.push("", result.gitignoreHint);
-	return lines.join("\n");
+	return stripControl(lines.join("\n"));
 }
 
 export const UNTRUSTED_NOTE =

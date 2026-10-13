@@ -3,6 +3,8 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { normalizePath } from "./fingerprint.ts";
+import { isInsideProject } from "./read-tools.ts";
+import { hasControlChars } from "./report.ts";
 import {
 	type AffirmArgument,
 	AffirmArgument as AffirmArgumentSchema,
@@ -29,12 +31,18 @@ function receipt(message: string, terminate = false) {
 	};
 }
 
-/** Anchors must point at existing lines of files inside the project; paths are normalized to project-relative. */
+/**
+ * Anchors must point at existing lines of files inside the project; paths are normalized to project-relative.
+ * Containment is checked after symbolic links are resolved, before the file is touched: otherwise a link in
+ * the repository would let an agent learn whether any file outside the project exists and how long it is.
+ */
 export function checkAnchors(root: string, anchors: Anchor[]): Anchor[] {
 	return anchors.map((anchor) => {
 		const absolute = resolve(root, anchor.file);
 		const rel = normalizePath(relative(root, absolute));
-		if (rel.startsWith("../") || isAbsolute(rel)) throw new Error(`Anchor file ${anchor.file} is outside the project.`);
+		if (rel.startsWith("../") || isAbsolute(rel) || !isInsideProject(root, absolute)) throw new Error(`Anchor file ${anchor.file} is outside the project.`);
+		// File names are shown in the terminal; one with control characters could carry escape sequences.
+		if (hasControlChars(rel)) throw new Error(`Anchor file ${JSON.stringify(anchor.file)} contains control characters; anchor a different file.`);
 		if (!existsSync(absolute) || !statSync(absolute).isFile()) throw new Error(`Anchor file ${anchor.file} does not exist. Use a path relative to the project root.`);
 		const lines = readFileSync(join(root, rel), "utf8").split("\n").length;
 		if (anchor.line > lines) throw new Error(`Anchor ${rel}:${anchor.line} is past the end of the file (${lines} lines).`);

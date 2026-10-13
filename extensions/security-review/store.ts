@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, type Stats, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { normalizePath, normalizeVulnType } from "./fingerprint.ts";
 import { git, resolveBaseRef, type Scope, STORE_DIR } from "./scope.ts";
@@ -31,8 +31,41 @@ export class StoreError extends Error {
 	}
 }
 
+function lstatOrUndefined(path: string): Stats | undefined {
+	try {
+		return lstatSync(path);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The store must be the project's own: `.security-review` and `runs/` real directories, and the files
+ * read back real files. A repository can commit any of them as a symbolic link. Through a link the
+ * store would be read from a file git does not list under the store, which the branch could change
+ * unnoticed by assertStoreTrusted, and written to wherever the link points, even outside the project.
+ */
+export function assertStoreLocal(root: string): void {
+	const checks: [path: string, kind: "directory" | "file"][] = [
+		[join(root, STORE_DIR), "directory"],
+		[join(root, STORE_DIR, RUNS_DIR), "directory"],
+		[storePath(root, FINDINGS_FILE), "file"],
+		[storePath(root, PROFILE_FILE), "file"],
+		[storePath(root, REPORT_FILE), "file"],
+	];
+	for (const [path, kind] of checks) {
+		const stat = lstatOrUndefined(path);
+		if (!stat) continue;
+		if (kind === "directory" ? stat.isDirectory() : stat.isFile()) continue;
+		throw new StoreError(
+			`${path} is ${stat.isSymbolicLink() ? "a symbolic link" : `not a ${kind}`}. /security-review keeps its state only in a real ${STORE_DIR}/ directory of the project. Remove it and run again.`,
+		);
+	}
+}
+
 /** Load the store. A missing file yields an empty store; an unreadable or invalid one throws so it is never overwritten. */
 export function loadStore(root: string): StoreFile {
+	assertStoreLocal(root);
 	const path = storePath(root);
 	if (!existsSync(path)) return emptyStore();
 	let data: unknown;
@@ -66,8 +99,11 @@ async function defaultBranchMergeBase(root: string): Promise<string | undefined>
  * Uncommitted changes are local and stay trusted.
  */
 export async function assertStoreTrusted(scope: Pick<Scope, "root" | "mergeBase">): Promise<void> {
+	assertStoreLocal(scope.root);
 	const files = [FINDINGS_FILE, PROFILE_FILE].map((file) => `${STORE_DIR}/${file}`);
-	const tracked = (await git(scope.root, ["ls-files", "-z", "--", ...files])).stdout.split("\0").filter(Boolean);
+	const listed = await git(scope.root, ["ls-files", "-z", "--", ...files]);
+	if (listed.code !== 0) throw new StoreError(`Could not check whether git tracks ${files.join(" and ")}: ${listed.stderr.trim()}`);
+	const tracked = listed.stdout.split("\0").filter(Boolean);
 	if (tracked.length === 0) return;
 	const base = scope.mergeBase ?? (await defaultBranchMergeBase(scope.root));
 	if (!base) return;
@@ -106,14 +142,20 @@ export function writeFileAtomic(path: string, content: string, hooks: AtomicWrit
 	}
 }
 
+/** Write a file of the store, after checking that the store is not redirected out of it (see assertStoreLocal). */
+export function writeStoreFile(root: string, file: string, content: string, hooks?: AtomicWriteHooks): string {
+	assertStoreLocal(root);
+	const path = join(root, STORE_DIR, file);
+	writeFileAtomic(path, content, hooks);
+	return path;
+}
+
 export function saveStore(root: string, store: StoreFile, hooks?: AtomicWriteHooks): void {
-	writeFileAtomic(storePath(root), `${JSON.stringify(store, null, 2)}\n`, hooks);
+	writeStoreFile(root, FINDINGS_FILE, `${JSON.stringify(store, null, 2)}\n`, hooks);
 }
 
 export function writeRunLog(root: string, run: RunRecord & Record<string, unknown>): string {
-	const path = join(root, STORE_DIR, RUNS_DIR, `${run.id}.json`);
-	writeFileAtomic(path, `${JSON.stringify(run, null, 2)}\n`);
-	return path;
+	return writeStoreFile(root, join(RUNS_DIR, `${run.id}.json`), `${JSON.stringify(run, null, 2)}\n`);
 }
 
 /** A finding produced by a run, before the store assigns identity and lifecycle fields. */
@@ -301,6 +343,7 @@ interface ProfileCache {
 }
 
 export function loadCachedProfile(root: string, fingerprint: string): Profile | undefined {
+	assertStoreLocal(root);
 	const path = storePath(root, PROFILE_FILE);
 	if (!existsSync(path)) return undefined;
 	try {
@@ -314,7 +357,7 @@ export function loadCachedProfile(root: string, fingerprint: string): Profile | 
 
 export function saveProfile(root: string, fingerprint: string, profile: Profile, now: string): void {
 	const cache: ProfileCache = { fingerprint, created_at: now, profile };
-	writeFileAtomic(storePath(root, PROFILE_FILE), `${JSON.stringify(cache, null, 2)}\n`);
+	writeStoreFile(root, PROFILE_FILE, `${JSON.stringify(cache, null, 2)}\n`);
 }
 
 // .gitignore recommendation

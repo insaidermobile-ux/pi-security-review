@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
@@ -21,6 +21,7 @@ import {
 	saveStore,
 	StoreError,
 	storePath,
+	writeRunLog,
 } from "../extensions/security-review/store.ts";
 import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
 import { commitAll, makeRepo, sh, write } from "./git-fixtures.ts";
@@ -378,6 +379,36 @@ describe("store trust", () => {
 		saveStore(root, { ...emptyStore(), gitignore_hint_shown: true });
 		await assertStoreTrusted({ root, mergeBase: mergeBase(root) });
 		await assertStoreTrusted({ root });
+	});
+
+	test("a store directory that is a symbolic link is refused before it is read or written", async () => {
+		const root = makeRepo();
+		const target = tempDir("sr-target-");
+		writeFileSync(join(target, "findings.json"), JSON.stringify(emptyStore()));
+		symlinkSync(target, join(root, ".security-review"));
+		sh(root, "add", ".security-review");
+		commitAll(root, "store as a link");
+		const refused = (error: unknown) => error instanceof StoreError && /\.security-review is a symbolic link/.test(error.message);
+		await assert.rejects(assertStoreTrusted({ root }), refused);
+		assert.throws(() => loadStore(root), refused);
+		assert.throws(() => loadCachedProfile(root, "fp"), refused);
+		assert.throws(() => saveStore(root, emptyStore()), refused);
+		assert.deepEqual(readdirSync(target), ["findings.json"]);
+	});
+
+	test("store files and the runs directory that are symbolic links are refused", async () => {
+		const root = makeRepo({ "docs/fixtures/findings.json": JSON.stringify(emptyStore()) });
+		mkdirSync(join(root, ".security-review"));
+		symlinkSync("../docs/fixtures/findings.json", join(root, FINDINGS));
+		await assert.rejects(assertStoreTrusted({ root }), /findings\.json is a symbolic link/);
+		assert.throws(() => loadStore(root), /findings\.json is a symbolic link/);
+
+		const other = makeRepo();
+		const target = tempDir("sr-target-");
+		mkdirSync(join(other, ".security-review"));
+		symlinkSync(target, join(other, ".security-review", "runs"));
+		assert.throws(() => writeRunLog(other, { ...run("diff"), finding_ids: [] }), /runs is a symbolic link/);
+		assert.deepEqual(readdirSync(target), []);
 	});
 
 	test("a tracked store is trusted when there is no default branch to compare with", async () => {

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { isInsideProject } from "./read-tools.ts";
+import { GIT_ENV, safeGitConfig } from "./scope.ts";
 
 export const SHELL_TOOL_NAME = "shell";
 const MAX_OUTPUT_BYTES = 50_000;
@@ -9,8 +10,13 @@ const COMMAND_TIMEOUT_MS = 30_000;
 
 /** Git subcommands that only read repository state. */
 const GIT_SUBCOMMANDS = new Set(["log", "show", "blame", "diff", "grep", "ls-files", "ls-tree", "rev-parse", "status", "cat-file"]);
-/** Subcommands that render diffs, where external diff drivers and textconv filters are disabled. */
-const GIT_DIFF_RENDERING = new Set(["log", "show", "diff"]);
+/** Hardening options per subcommand: external diff drivers and textconv run programs from the repository's config. */
+const GIT_HARDENING = new Map<string, string[]>([
+	["log", ["--no-ext-diff", "--no-textconv"]],
+	["show", ["--no-ext-diff", "--no-textconv"]],
+	["diff", ["--no-ext-diff", "--no-textconv"]],
+	["blame", ["--no-textconv"]],
+]);
 
 /** Options of one command that write files, run other programs, or read outside the project. */
 interface OptionRules {
@@ -26,7 +32,8 @@ interface OptionRules {
 
 const NO_RULES: OptionRules = { long: [], exact: [], short: "", shortWithValue: "" };
 const GIT_RULES: OptionRules = {
-	long: ["--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec", "--upload-pack"],
+	// Submodules have their own config, whose filter drivers safeGitConfig does not see.
+	long: ["--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec", "--upload-pack", "--ignore-submodules", "--submodule", "--recurse-submodules"],
 	exact: ["--text"],
 	short: "",
 	shortWithValue: "",
@@ -40,8 +47,10 @@ const OPTION_RULES = new Map<string, OptionRules>([
 	["tail", { long: ["--follow", "--retry"], exact: [], short: "fF", shortWithValue: "ncb" }],
 	["cat", NO_RULES],
 	["head", NO_RULES],
-	["ls", NO_RULES],
-	["wc", NO_RULES],
+	// Following a symlink inside a listed directory (-L, -H) reaches files outside the project that no argument names.
+	["ls", { long: ["--dereference", "--dereference-command-line", "--dereference-command-line-symlink-to-dir"], exact: [], short: "LH", shortWithValue: "" }],
+	// GNU wc --files0-from opens every path listed in a file, which the per-argument path check never sees.
+	["wc", { long: ["--files0-from"], exact: [], short: "", shortWithValue: "" }],
 ]);
 
 export const ALLOWED_COMMANDS = [...OPTION_RULES.keys()];
@@ -144,8 +153,7 @@ export function checkCommand(command: string, root: string): string[] {
 	}
 	if (program === "git") {
 		const [sub, ...rest] = args;
-		const hardening = GIT_DIFF_RENDERING.has(sub!) ? ["--no-ext-diff", "--no-textconv"] : [];
-		return ["git", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "--no-pager", sub!, ...hardening, ...rest];
+		return ["git", "-c", "core.pager=cat", "--no-pager", sub!, ...(GIT_HARDENING.get(sub!) ?? []), ...rest];
 	}
 	return argv;
 }
@@ -169,14 +177,15 @@ function capture(stream: NodeJS.ReadableStream): { text: () => string; overflowe
 	return { text: () => Buffer.concat(chunks).toString(), overflowed: () => dropped };
 }
 
-export function runChecked(argv: string[], root: string, signal?: AbortSignal): Promise<ShellResult> {
+export async function runChecked(argv: string[], root: string, signal?: AbortSignal): Promise<ShellResult> {
+	const command = argv[0] === "git" ? ["git", ...(await safeGitConfig(root)), ...argv.slice(1)] : argv;
 	return new Promise((resolvePromise) => {
 		// stdin is closed: with an open pipe, rg and cat without a path argument would wait for input.
-		const child = spawn(argv[0]!, argv.slice(1), {
+		const child = spawn(command[0]!, command.slice(1), {
 			cwd: root,
 			signal,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", PAGER: "cat", GIT_PAGER: "cat" },
+			env: { ...process.env, ...GIT_ENV, PAGER: "cat", GIT_PAGER: "cat" },
 		});
 		const stdout = capture(child.stdout);
 		const stderr = capture(child.stderr);

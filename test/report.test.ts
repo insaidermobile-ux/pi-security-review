@@ -123,6 +123,11 @@ describe("report", () => {
 		assert.doesNotMatch(render(), /Stale marking skipped/);
 	});
 
+	test("control characters from agents do not reach the report", () => {
+		const output = renderReport({ run: { ...run, complete: true, incomplete_reasons: [] }, scope: { mode: "full" }, findings: [], refuted: [], unverified: [], summary: "a\u001b]8;;x\u0007b\r\nc\td" });
+		assert.match(output, /a\uFFFD\]8;;x\uFFFDb\nc\td/);
+	});
+
 	test("counts by severity", () => {
 		assert.deepEqual(countBySeverity([risk, finding({})]), { critical: 0, high: 1, medium: 1, low: 0 });
 	});

@@ -1,16 +1,24 @@
 import assert from "node:assert/strict";
-import { existsSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import { AGENT_RETRY, createAuditSession, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
 import { mapBounded } from "../extensions/security-review/pool.ts";
 import { createReadOnlyTools, isInsideProject } from "../extensions/security-review/read-tools.ts";
+import { git } from "../extensions/security-review/scope.ts";
 import { checkCommand, createShellTool, ShellRejection } from "../extensions/security-review/shell.ts";
-import { createAffirmTool, createHypothesisTool, createTriageTool, type HypothesisCollector, type TriageCollector } from "../extensions/security-review/submit-tools.ts";
+import {
+	checkAnchors,
+	createAffirmTool,
+	createHypothesisTool,
+	createTriageTool,
+	type HypothesisCollector,
+	type TriageCollector,
+} from "../extensions/security-review/submit-tools.ts";
 import type { AffirmArgument } from "../extensions/security-review/schema.ts";
 import { failTimes, fauxAssistantMessage, fauxToolCall, hang, providerError, RATE_LIMITED, scriptedRuntime, type ScriptStep } from "./faux.ts";
 import { affirm, hypothesisInput } from "./fixtures.ts";
-import { makeRepo, write } from "./git-fixtures.ts";
+import { makeRepo, sh, write } from "./git-fixtures.ts";
 import { tempDir } from "./temp.ts";
 
 const SYSTEM = "You are a test auditor.";
@@ -63,9 +71,11 @@ describe("read-only shell", () => {
 		assert.deepEqual(checkCommand("rg -n 'select .* from' src", root), ["rg", "-n", "select .* from", "src"]);
 		assert.deepEqual(checkCommand("cat src/a.ts", root), ["cat", "src/a.ts"]);
 		assert.deepEqual(checkCommand("git log -n 3 -- src/a.ts", root), [
-			"git", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "--no-pager", "log", "--no-ext-diff", "--no-textconv", "-n", "3", "--", "src/a.ts",
+			"git", "-c", "core.pager=cat", "--no-pager", "log", "--no-ext-diff", "--no-textconv", "-n", "3", "--", "src/a.ts",
 		]);
-		assert.ok(checkCommand("git blame -L 10,20 src/a.ts", root).includes("blame"));
+		assert.deepEqual(checkCommand("git blame -L 10,20 src/a.ts", root).slice(4), ["blame", "--no-textconv", "-L", "10,20", "src/a.ts"]);
+		assert.deepEqual(checkCommand("ls -laR src", root), ["ls", "-laR", "src"]);
+		assert.deepEqual(checkCommand("wc -l src/a.ts", root), ["wc", "-l", "src/a.ts"]);
 		assert.ok(checkCommand("git diff HEAD~3..HEAD", root).includes("diff"));
 	});
 
@@ -106,6 +116,16 @@ describe("read-only shell", () => {
 		["git grep -nO sh x", /not allowed/],
 		["git grep -5Osh x", /not allowed/],
 		["rg --follow foo", /not allowed/],
+		// ls and wc must not reach files outside the project through a symbolic link inside it.
+		["ls -lRL src", /not allowed/],
+		["ls -H src", /not allowed/],
+		["ls --dereference src", /not allowed/],
+		["ls --deref src", /not allowed/],
+		["wc --files0-from=list.txt", /not allowed/],
+		// A submodule's config, and so its filter drivers, are not neutralized.
+		["git status --ignore-submodules=none", /not allowed/],
+		["git diff --submodule=diff", /not allowed/],
+		["git grep --recurse-submodules x", /not allowed/],
 		["rg -L foo", /not allowed/],
 		["rg -f/etc/passwd foo", /outside the project/],
 		["rg -f=/etc/passwd foo", /outside the project/],
@@ -153,6 +173,27 @@ describe("read-only shell", () => {
 		const command = `git grep "--op=sh -c 'echo pwned > pwned' #" token`;
 		await assert.rejects(createShellTool(repo).execute("1", { command }, undefined, undefined, undefined as never), ShellRejection);
 		assert.equal(existsSync(join(repo, "pwned")), false);
+	});
+
+	test("programs configured by the repository do not run while reading it", async () => {
+		const repo = makeRepo({ "a.txt": "hello\n", ".gitattributes": "a.txt filter=x diff=x\n" });
+		const marks = tempDir("sr-marks-");
+		sh(repo, "config", "filter.x.clean", `sh -c 'touch ${marks}/clean; cat'`);
+		sh(repo, "config", "filter.x.smudge", `sh -c 'touch ${marks}/smudge; cat'`);
+		sh(repo, "config", "filter.x.required", "true");
+		sh(repo, "config", "diff.x.textconv", `sh -c 'touch ${marks}/textconv; cat "$0"'`);
+		sh(repo, "config", "log.showSignature", "true");
+		sh(repo, "config", "gpg.program", `sh -c 'touch ${marks}/gpg' --`);
+		const tool = createShellTool(repo);
+		for (const command of ["git status", "git blame a.txt", "git cat-file --filters HEAD:a.txt", "git diff HEAD", "git log -p --format=%G?"]) {
+			// A stale modification time makes git re-read the file through the clean filter.
+			utimesSync(join(repo, "a.txt"), new Date(0), new Date(0));
+			const result = await tool.execute("1", { command }, undefined, undefined, undefined as never);
+			assert.match(result.content[0]!.type === "text" ? result.content[0]!.text : "", /^exit 0/, command);
+		}
+		utimesSync(join(repo, "a.txt"), new Date(0), new Date(0));
+		assert.equal((await git(repo, ["status", "--porcelain"])).code, 0);
+		assert.deepEqual(readdirSync(marks), []);
 	});
 
 	test("refuses a symbolic link that leaves the project", () => {
@@ -217,6 +258,31 @@ describe("confined read tools", () => {
 		assert.equal(isInsideProject(repo, "."), true);
 		assert.equal(isInsideProject("/no/such/root", "src/a.ts"), true);
 		assert.equal(isInsideProject("/no/such/root", "/etc/passwd"), false);
+		// A missing file behind a link out of the project is refused like an existing one.
+		const { repo: linked, outsideDir } = fixture();
+		symlinkSync(join(outsideDir, "missing.txt"), join(linked, "dangling.txt"));
+		for (const path of ["linked-dir/missing.txt", "linked-dir/no/such/dir", "dangling.txt"]) assert.equal(isInsideProject(linked, path), false, path);
+	});
+});
+
+describe("anchor checks", () => {
+	test("refuse a file reached through a symbolic link that leaves the project, without revealing it", () => {
+		const repo = makeRepo({ "src/a.ts": "1\n2\n" });
+		const outside = tempDir("sr-outside-");
+		writeFileSync(join(outside, "secret.txt"), "S\n".repeat(50));
+		symlinkSync(outside, join(repo, "vendor"));
+		symlinkSync(join(outside, "missing.txt"), join(repo, "src/dangling.txt"));
+		for (const file of ["vendor/secret.txt", "vendor/missing.txt", "src/dangling.txt"]) {
+			assert.throws(() => checkAnchors(repo, [{ file, line: 999_999 }]), /is outside the project\.$/);
+		}
+		assert.deepEqual(checkAnchors(repo, [{ file: "./src/a.ts", line: 2 }]), [{ file: "src/a.ts", line: 2 }]);
+	});
+
+	test("refuse a file name with control characters", () => {
+		const repo = makeRepo({ "src/a.ts": "1\n" });
+		const name = "src/a\u001b]8;;evil.example\u0007ok.ts";
+		writeFileSync(join(repo, name), "1\n");
+		assert.throws(() => checkAnchors(repo, [{ file: name, line: 1 }]), /control characters/);
 	});
 });
 

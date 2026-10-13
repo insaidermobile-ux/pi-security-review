@@ -41,18 +41,62 @@ interface GitResult {
 	stderr: string;
 }
 
-export function git(cwd: string, args: string[]): Promise<GitResult> {
+/**
+ * Environment for every git process. A read never fetches: a partial clone would otherwise fetch a
+ * missing object through a transport the repository's config chooses, and the empty protocol
+ * allowlist overrides any `protocol.*.allow` in that config.
+ */
+export const GIT_ENV: Readonly<Record<string, string>> = {
+	GIT_OPTIONAL_LOCKS: "0",
+	GIT_TERMINAL_PROMPT: "0",
+	GIT_NO_LAZY_FETCH: "1",
+	GIT_ALLOW_PROTOCOL: "",
+};
+
+/** Overrides for configured programs that are not named per driver. */
+const STATIC_OVERRIDES = [
+	"core.fsmonitor=false",
+	"log.showSignature=false",
+	"gpg.program=false",
+	"gpg.openpgp.program=false",
+	"gpg.x509.program=false",
+	"gpg.ssh.program=false",
+	// A submodule's own config is not read below, so status and diff do not descend into submodules.
+	"diff.ignoreSubmodules=all",
+];
+
+const FILTER_KEY = /^filter\.(.+)\.(?:clean|smudge|process|required)$/;
+
+function run(cwd: string, args: string[]): Promise<GitResult> {
 	return new Promise((resolve) => {
-		execFile(
-			"git",
-			["-c", "core.quotepath=off", ...args],
-			{ cwd, maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" } },
-			(error, stdout, stderr) => {
-				const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
-				resolve({ code, stdout: stdout.toString(), stderr: stderr.toString() });
-			},
-		);
+		execFile("git", args, { cwd, maxBuffer: 256 * 1024 * 1024, env: { ...process.env, ...GIT_ENV } }, (error, stdout, stderr) => {
+			const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
+			resolve({ code, stdout: stdout.toString(), stderr: stderr.toString() });
+		});
 	});
+}
+
+/**
+ * `-c` options that switch off the programs git takes from configuration while it reads. The audited
+ * project can come with its own `.git/config`, so its config is as untrusted as its files: `status`,
+ * `blame`, and a diff against the work tree run filter drivers, `cat-file --filters` runs smudge, and
+ * signature checks run gpg. Filter drivers have arbitrary names, so the configured ones are listed
+ * and each is emptied. Diff drivers and textconv are disabled per command with --no-ext-diff and
+ * --no-textconv.
+ */
+export async function safeGitConfig(cwd: string): Promise<string[]> {
+	const listed = await run(cwd, ["config", "-z", "--list"]);
+	const drivers = new Set<string>();
+	for (const entry of listed.stdout.split("\0")) {
+		const match = FILTER_KEY.exec(entry.split("\n", 1)[0]!);
+		if (match) drivers.add(match[1]!);
+	}
+	const filters = [...drivers].flatMap((name) => ["clean=", "smudge=", "process=", "required=false"].map((setting) => `filter.${name}.${setting}`));
+	return [...STATIC_OVERRIDES, ...filters].flatMap((setting) => ["-c", setting]);
+}
+
+export async function git(cwd: string, args: string[]): Promise<GitResult> {
+	return run(cwd, ["-c", "core.quotepath=off", ...(await safeGitConfig(cwd)), ...args]);
 }
 
 async function gitOk(cwd: string, args: string[], what: string): Promise<string> {

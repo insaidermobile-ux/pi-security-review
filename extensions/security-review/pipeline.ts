@@ -36,8 +36,8 @@ import {
 	saveStore,
 	StoreError,
 	storePath,
-	writeFileAtomic,
 	writeRunLog,
+	writeStoreFile,
 } from "./store.ts";
 import {
 	type ArgumentCollector,
@@ -483,7 +483,7 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	// The report and run log are written before the summary agent runs, so interrupting it loses only the summary.
 	const reportPath = storePath(scope.root, REPORT_FILE);
 	const writeOutputs = (summary?: string) => {
-		writeFileAtomic(reportPath, renderReport({ run: merged.run, scope, findings: merged.observed, refuted, unverified, summary }));
+		writeStoreFile(scope.root, REPORT_FILE, renderReport({ run: merged.run, scope, findings: merged.observed, refuted, unverified, summary }));
 		return writeRunLog(scope.root, { ...merged.run, ...logDetails, agents: agentLog(), summary });
 	};
 	let runLogPath = writeOutputs();

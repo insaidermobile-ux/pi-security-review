@@ -111,6 +111,20 @@ describe("session summary", () => {
 		const full = result([], { run: { ...result([]).run, mode: "full", complete: false, incomplete_reasons: ["hunt agent failed (x)"] } });
 		assert.match(formatSummary(full, "/repo", "u"), /hunt agent failed \(x\)\nStale marking skipped: the run was incomplete\./);
 	});
+	test("agent text cannot carry terminal escapes or hidden links", () => {
+		const esc = "\u001b]52;c;cHduZWQ=\u0007";
+		const text = formatSummary(
+			result([{ id: "SR-001", severity: "high", finding_class: "vulnerability", title: `T${esc}`, anchors: [{ file: `a${esc}.js`, line: 3 }], status: "open" }], {
+				summary: `Details: [the fix](https://evil.example) and [ref]\n\n[ref]: https://evil.example\r\n\u001b[2J`,
+				run: { ...result([]).run, complete: false, incomplete_reasons: ["agent failed: \u009b31m"] },
+			}),
+			"/repo",
+			"u",
+		);
+		assert.doesNotMatch(text, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
+		assert.match(text, /\[the fix\] \(https:\/\/evil\.example\)/);
+		assert.match(text, /^\[ref\] : https:\/\/evil\.example$/m);
+	});
 });
 
 describe("summary for the session model", () => {
