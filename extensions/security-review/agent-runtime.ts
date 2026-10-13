@@ -95,6 +95,9 @@ export interface AgentOutcome {
 	usage: Usage;
 }
 
+/** The error of an agent stopped by the run's abort signal. */
+export const CANCELLED = "cancelled";
+
 export interface AgentRunner {
 	run(spec: AgentSpec, signal?: AbortSignal): Promise<AgentOutcome>;
 }
@@ -183,7 +186,7 @@ export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
 			let timer: NodeJS.Timeout | undefined;
 			const onAbort = () => void session?.abort();
 			try {
-				if (signal?.aborted) return { label: spec.label, ok: false, timedOut: false, error: "cancelled", usage };
+				if (signal?.aborted) return { label: spec.label, ok: false, timedOut: false, error: CANCELLED, usage };
 				session = await createAuditSession(options, spec);
 				const audit = session;
 				const bridged = spec.model.provider === BRIDGE_PROVIDER;
@@ -212,7 +215,7 @@ export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
 				}
 
 				if (timedOut) return { label: spec.label, ok: false, timedOut, error: `timed out after ${Math.round(options.timeoutMs / 1000)}s`, usage };
-				if (signal?.aborted) return { label: spec.label, ok: false, timedOut, error: "cancelled", usage };
+				if (signal?.aborted) return { label: spec.label, ok: false, timedOut, error: CANCELLED, usage };
 				const failure = lastAssistantError(session);
 				if (failure) {
 					const kind = failure.transient ? { transient: true as const } : failure.rejected ? { rejected: true as const } : {};

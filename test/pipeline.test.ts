@@ -681,4 +681,30 @@ describe("end-to-end with scripted model responses", () => {
 		assert.match(readFileSync(result.reportPath, "utf8"), /## Summary\n\nOne SQL injection in user search\./);
 		assert.equal((JSON.parse(readFileSync(result.runLogPath, "utf8")) as { summary?: string }).summary, "One SQL injection in user search.");
 	});
+
+	test("a cancelled run keeps what was verified and is reported as cancelled", async () => {
+		const root = makeFixtureRepo();
+		const scripts = fixtureScripts();
+		scripts["Agent: affirmer:H-002"] = [hang];
+		const env = await setup(scripts);
+		const controller = new AbortController();
+		const deps = env.makeDeps(root);
+		const result = await runPipeline(await resolveScope(root, "diff"), {
+			...deps,
+			signal: controller.signal,
+			// H-001 is verified; H-002's affirmer is still waiting for the model.
+			onProgress: (progress) => {
+				if (progress.stage === "verify" && progress.done === 1) controller.abort();
+			},
+		});
+		assert.deepEqual(result.run.incomplete_reasons, ["the review was cancelled"]);
+		assert.equal(result.run.complete, false);
+		assert.deepEqual(result.findings.map((f) => f.id), ["SR-001"]);
+		assert.deepEqual(result.unverified.map((h) => h.id), ["H-002"]);
+		assert.equal(result.summary, undefined);
+		assert.equal(env.calls.some((call) => call.startsWith("Agent: report")), false, "no summary agent after a cancellation");
+		assert.deepEqual(loadStore(root).findings.map((f) => f.id), ["SR-001"]);
+		assert.match(readFileSync(result.reportPath, "utf8"), /Incomplete run:\*\* the review was cancelled/);
+		assert.doesNotMatch(result.run.errors.join("\n"), /summary unavailable/);
+	});
 });

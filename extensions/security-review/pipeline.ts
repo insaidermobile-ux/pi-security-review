@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { type AgentOutcome, type AgentRunner, emptyUsage } from "./agent-runtime.ts";
+import { type AgentOutcome, type AgentRunner, CANCELLED, emptyUsage } from "./agent-runtime.ts";
 import { fingerprint, formatTitle, normalizeVulnType } from "./fingerprint.ts";
 import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, type TaggedHypothesis } from "./partition.ts";
 import { mapBounded } from "./pool.ts";
@@ -68,6 +68,9 @@ export interface PipelineDeps {
 	signal?: AbortSignal;
 }
 
+/** The incomplete reason of a run stopped by its abort signal. */
+export const CANCELLED_REASON = "the review was cancelled";
+
 export interface RunResult {
 	run: RunRecord;
 	scope: Scope;
@@ -116,12 +119,14 @@ function shorten(text: string, max: number): string {
 /**
  * Incomplete-run reasons for a stage's failed agents, one per distinct error, in first-seen order.
  * A provider that refuses every request would otherwise repeat the same long error once per agent;
- * the run log keeps each agent's full error.
+ * the run log keeps each agent's full error. Agents stopped by a cancellation are left out: the
+ * cancellation is reported once for the run.
  */
 export function failureReasons(stage: string, failed: AgentOutcome[]): string[] {
 	const groups = new Map<string, string[]>();
 	for (const outcome of failed) {
 		const error = outcome.error ?? "failed";
+		if (error === CANCELLED) continue;
 		groups.set(error, [...(groups.get(error) ?? []), outcome.label]);
 	}
 	return [...groups].map(([error, labels]) => {
@@ -377,7 +382,10 @@ export async function verifyStage(
 	);
 }
 
-/** Run profile, hunt, verify, and report for a resolved scope, and persist the results. */
+/**
+ * Run profile, hunt, verify, and report for a resolved scope, and persist the results. A cancelled run
+ * (see `deps.signal`) stops its agents and still persists what was verified, as an incomplete run.
+ */
 export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<RunResult> {
 	const now = deps.now ?? (() => new Date());
 	const started = now();
@@ -424,6 +432,8 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	incomplete.push(...failureReasons("verification", verifyFailures));
 	// A verified hypothesis that could not be recorded was not accounted for: the run must not count as a complete observation.
 	if (invalid) incomplete.push(`${invalid} verified ${invalid === 1 ? "hypothesis" : "hypotheses"} could not be recorded as ${invalid === 1 ? "a finding" : "findings"} (see Errors)`);
+	const cancelled = deps.signal?.aborted === true;
+	if (cancelled) incomplete.unshift(CANCELLED_REASON);
 
 	deps.onProgress?.({ stage: "report" });
 	const finished = now();
@@ -479,7 +489,7 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	let runLogPath = writeOutputs();
 
 	let summary: string | undefined;
-	if (merged.observed.length > 0 || refuted.length > 0) {
+	if (!cancelled && (merged.observed.length > 0 || refuted.length > 0)) {
 		const collector: { summary?: string } = {};
 		const outcome = await deps.runner.run(
 			{
@@ -510,7 +520,7 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 		agents.push(outcome);
 		summary = collector.summary;
 		// Recorded in the report and the run log; the store was saved before the summary agent ran.
-		if (!summary) errors.push(`report summary unavailable (${describeFailure(outcome)})`);
+		if (!summary && outcome.error !== CANCELLED) errors.push(`report summary unavailable (${describeFailure(outcome)})`);
 		runLogPath = writeOutputs(summary);
 	}
 
