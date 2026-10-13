@@ -69,6 +69,16 @@ describe("read-only shell", () => {
 		assert.ok(checkCommand("git diff HEAD~3..HEAD", root).includes("diff"));
 	});
 
+	test("allows options that only resemble denied ones", () => {
+		// The pickaxe value and the pattern contain "O", which is a pager option only as a `git grep` flag.
+		assert.ok(checkCommand("git log -SOAuth", root).includes("-SOAuth"));
+		assert.ok(checkCommand("git grep -eOAuth src", root).includes("-eOAuth"));
+		assert.ok(checkCommand("git diff --text HEAD~1", root).includes("--text"));
+		assert.ok(checkCommand("git diff --output-indicator-new=x HEAD~1", root).includes("diff"));
+		assert.deepEqual(checkCommand("rg -tzig main", root), ["rg", "-tzig", "main"]);
+		assert.deepEqual(checkCommand("rg foo -- -z", root), ["rg", "foo", "--", "-z"]);
+	});
+
 	const rejected: Array<[string, RegExp]> = [
 		["rm -rf src", /not allowed/],
 		["bash -c ls", /not allowed/],
@@ -87,6 +97,23 @@ describe("read-only shell", () => {
 		["git diff --ext-diff", /not allowed/],
 		["git grep -Ocat foo", /not allowed/],
 		["git grep --open-files-in-pager=sh x", /not allowed/],
+		// git accepts unambiguous abbreviations of long options.
+		["git grep \"--op=sh -c 'id > pwned' #\" x", /--op=sh .* is not allowed/],
+		["git grep --open x", /not allowed/],
+		["git log --outp=pwned", /not allowed/],
+		["git diff --ext", /not allowed/],
+		["git show --textc", /not allowed/],
+		["git grep -nO sh x", /not allowed/],
+		["git grep -5Osh x", /not allowed/],
+		["rg --follow foo", /not allowed/],
+		["rg -L foo", /not allowed/],
+		["rg -f/etc/passwd foo", /outside the project/],
+		["rg -f=/etc/passwd foo", /outside the project/],
+		["cat -- /etc/passwd", /outside the project/],
+		// Names inherited from Object.prototype are not commands.
+		["constructor", /not allowed/],
+		["toString x", /not allowed/],
+		["__proto__", /not allowed/],
 		["rg --pre sh foo", /not allowed/],
 		["rg --pre=./x foo", /not allowed/],
 		["rg -zl foo", /not allowed/],
@@ -111,6 +138,31 @@ describe("read-only shell", () => {
 		assert.match(text, /^exit 0\nsrc\/a\.ts:1:const token/);
 		const log = await tool.execute("2", { command: "git log --oneline" }, undefined, undefined, undefined as never);
 		assert.match(log.content[0]!.type === "text" ? log.content[0]!.text : "", /initial/);
+	});
+
+	test("searches the project when no path is given instead of waiting on stdin", async () => {
+		const repo = makeRepo({ "src/a.ts": "const token = 'x';\n" });
+		const started = Date.now();
+		const result = await createShellTool(repo).execute("1", { command: "rg -n token" }, undefined, undefined, undefined as never);
+		assert.match(result.content[0]!.type === "text" ? result.content[0]!.text : "", /^exit 0\nsrc\/a\.ts:1:const token/);
+		assert.ok(Date.now() - started < 10_000);
+	});
+
+	test("an abbreviated pager option cannot run a program", async () => {
+		const repo = makeRepo({ "src/a.ts": "const token = 'x';\n" });
+		const command = `git grep "--op=sh -c 'echo pwned > pwned' #" token`;
+		await assert.rejects(createShellTool(repo).execute("1", { command }, undefined, undefined, undefined as never), ShellRejection);
+		assert.equal(existsSync(join(repo, "pwned")), false);
+	});
+
+	test("refuses a symbolic link that leaves the project", () => {
+		const repo = makeRepo({ "src/a.ts": "1\n" });
+		const outside = join(tempDir("sr-outside-"), "secret.txt");
+		writeFileSync(outside, "SECRET\n");
+		symlinkSync(outside, join(repo, "src/link.txt"));
+		symlinkSync("a.ts", join(repo, "src/inside.txt"));
+		assert.throws(() => checkCommand("cat src/link.txt", repo), /outside the project/);
+		assert.deepEqual(checkCommand("cat src/inside.txt", repo), ["cat", "src/inside.txt"]);
 	});
 });
 

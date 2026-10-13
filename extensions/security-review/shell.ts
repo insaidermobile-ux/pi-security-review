@@ -1,7 +1,7 @@
-import { execFile } from "node:child_process";
-import { isAbsolute, relative, resolve } from "node:path";
+import { spawn } from "node:child_process";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { isInsideProject } from "./read-tools.ts";
 
 export const SHELL_TOOL_NAME = "shell";
 const MAX_OUTPUT_BYTES = 50_000;
@@ -12,18 +12,39 @@ const GIT_SUBCOMMANDS = new Set(["log", "show", "blame", "diff", "grep", "ls-fil
 /** Subcommands that render diffs, where external diff drivers and textconv filters are disabled. */
 const GIT_DIFF_RENDERING = new Set(["log", "show", "diff"]);
 
-/** Options that write files or run other programs, per command. A trailing "=" also matches "--opt=value". */
-const DENIED_OPTIONS: Record<string, readonly string[]> = {
-	git: ["--output", "--ext-diff", "--textconv", "-O", "--open-files-in-pager", "--exec", "--upload-pack"],
-	rg: ["--pre", "--pre-glob", "-z", "--search-zip", "--hostname-bin"],
-	tail: ["-f", "-F", "--follow", "--retry"],
-	cat: [],
-	head: [],
-	ls: [],
-	wc: [],
-};
+/** Options of one command that write files, run other programs, or read outside the project. */
+interface OptionRules {
+	/** Long options. Every prefix of one is refused too, because git accepts unambiguous abbreviations. */
+	long: readonly string[];
+	/** Long options that are a prefix of a denied one but are safe themselves. */
+	exact: readonly string[];
+	/** Short flags, also refused inside a combined argument such as `-zl`. */
+	short: string;
+	/** Short options that take a value: the rest of a combined argument is that value, not more flags. */
+	shortWithValue: string;
+}
 
-export const ALLOWED_COMMANDS = Object.keys(DENIED_OPTIONS);
+const NO_RULES: OptionRules = { long: [], exact: [], short: "", shortWithValue: "" };
+const GIT_RULES: OptionRules = {
+	long: ["--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec", "--upload-pack"],
+	exact: ["--text"],
+	short: "",
+	shortWithValue: "",
+};
+/** `git grep -O<pager>` runs the pager; elsewhere `-O` only names an order file. */
+const GIT_GREP_RULES: OptionRules = { ...GIT_RULES, short: "O", shortWithValue: "efABCm" };
+
+const OPTION_RULES = new Map<string, OptionRules>([
+	["git", GIT_RULES],
+	["rg", { long: ["--pre", "--pre-glob", "--search-zip", "--hostname-bin", "--follow"], exact: [], short: "zL", shortWithValue: "efgtTABCmMjdEr" }],
+	["tail", { long: ["--follow", "--retry"], exact: [], short: "fF", shortWithValue: "ncb" }],
+	["cat", NO_RULES],
+	["head", NO_RULES],
+	["ls", NO_RULES],
+	["wc", NO_RULES],
+]);
+
+export const ALLOWED_COMMANDS = [...OPTION_RULES.keys()];
 
 export class ShellRejection extends Error {
 	constructor(message: string) {
@@ -73,23 +94,29 @@ export function tokenize(command: string): string[] {
 	return argv;
 }
 
-function isDenied(arg: string, denied: readonly string[]): boolean {
-	return denied.some((option) => {
-		if (arg === option || arg.startsWith(`${option}=`)) return true;
-		// Combined short flags such as `-zl` or attached values such as `-Ocat`.
-		return /^-[A-Za-z]$/.test(option) && /^-[A-Za-z]/.test(arg) && !arg.startsWith("--") && arg.slice(1).includes(option[1]!);
-	});
-}
-
-function looksLikePath(value: string): boolean {
-	return isAbsolute(value) || value.startsWith("~") || value === ".." || value.startsWith("../") || value.includes("/../") || value.endsWith("/..");
+/** Check one option against the rules and return the values embedded in it, which are checked as paths. */
+function optionValues(program: string, arg: string, rules: OptionRules): string[] {
+	const refuse = () => new ShellRejection(`Option ${arg} is not allowed for ${program}.`);
+	const equals = arg.indexOf("=");
+	const afterEquals = equals < 0 ? [] : [arg.slice(equals + 1)];
+	if (arg.startsWith("--")) {
+		const name = equals < 0 ? arg : arg.slice(0, equals);
+		if (!rules.exact.includes(name) && rules.long.some((option) => option.startsWith(name))) throw refuse();
+		return afterEquals;
+	}
+	for (let i = 1; i < arg.length; i++) {
+		if (rules.short.includes(arg[i]!)) throw refuse();
+		if (rules.shortWithValue.includes(arg[i]!)) return [arg.slice(i + 1).replace(/^=/, "")];
+	}
+	return afterEquals;
 }
 
 function assertInsideRoot(root: string, value: string): void {
-	if (!looksLikePath(value)) return;
-	if (value.startsWith("~")) throw new ShellRejection(`Path ${value} is outside the project.`);
-	const rel = relative(root, resolve(root, value));
-	if (rel === ".." || rel.startsWith("../") || isAbsolute(rel)) throw new ShellRejection(`Path ${value} is outside the project.`);
+	if (value.startsWith("~") || !isInsideProject(root, value)) {
+		throw new ShellRejection(
+			`Path ${value} is outside the project. Arguments that look like a path outside it are refused even when meant as a search pattern; rewrite such a pattern, for example as [/]etc.`,
+		);
+	}
 }
 
 /** Validate a command against the allowlist and return the argv to execute. Throws ShellRejection otherwise. */
@@ -97,7 +124,8 @@ export function checkCommand(command: string, root: string): string[] {
 	const argv = tokenize(command.trim());
 	const program = argv[0];
 	if (!program) throw new ShellRejection("Empty command.");
-	if (!(program in DENIED_OPTIONS)) {
+	let rules = OPTION_RULES.get(program);
+	if (!rules) {
 		throw new ShellRejection(`Command "${program}" is not allowed. Allowed commands: ${ALLOWED_COMMANDS.join(", ")}. Use the read, grep, find, and ls tools for other inspection.`);
 	}
 	const args = argv.slice(1);
@@ -106,11 +134,13 @@ export function checkCommand(command: string, root: string): string[] {
 		if (!sub || !GIT_SUBCOMMANDS.has(sub)) {
 			throw new ShellRejection(`"git ${sub ?? ""}" is not allowed. The subcommand must come first and be one of: ${[...GIT_SUBCOMMANDS].join(", ")}.`);
 		}
+		if (sub === "grep") rules = GIT_GREP_RULES;
 	}
+	let options = true;
 	for (const arg of args) {
-		if (isDenied(arg, DENIED_OPTIONS[program]!)) throw new ShellRejection(`Option ${arg} is not allowed for ${program}.`);
-		const value = arg.startsWith("-") && arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : arg;
-		assertInsideRoot(root, value);
+		if (options && arg === "--") options = false;
+		else if (options && arg.startsWith("-") && arg.length > 1) for (const value of optionValues(program, arg, rules)) assertInsideRoot(root, value);
+		else assertInsideRoot(root, arg);
 	}
 	if (program === "git") {
 		const [sub, ...rest] = args;
@@ -126,29 +156,54 @@ interface ShellResult {
 	truncated: boolean;
 }
 
+/** Collects a stream's output up to the cap and counts the rest, so a huge output cannot exhaust memory. */
+function capture(stream: NodeJS.ReadableStream): { text: () => string; overflowed: () => boolean } {
+	const chunks: Buffer[] = [];
+	let kept = 0;
+	let dropped = false;
+	stream.on("data", (chunk: Buffer) => {
+		if (kept < MAX_OUTPUT_BYTES) chunks.push(chunk.subarray(0, MAX_OUTPUT_BYTES - kept));
+		if (kept + chunk.length > MAX_OUTPUT_BYTES) dropped = true;
+		kept = Math.min(MAX_OUTPUT_BYTES, kept + chunk.length);
+	});
+	return { text: () => Buffer.concat(chunks).toString(), overflowed: () => dropped };
+}
+
 export function runChecked(argv: string[], root: string, signal?: AbortSignal): Promise<ShellResult> {
 	return new Promise((resolvePromise) => {
-		execFile(
-			argv[0]!,
-			argv.slice(1),
-			{
-				cwd: root,
-				timeout: COMMAND_TIMEOUT_MS,
-				maxBuffer: 8 * 1024 * 1024,
-				signal,
-				env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", PAGER: "cat", GIT_PAGER: "cat" },
-			},
-			(error, stdout, stderr) => {
-				let output = `${stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`;
-				const truncated = Buffer.byteLength(output) > MAX_OUTPUT_BYTES;
-				if (truncated) {
-					output = `${Buffer.from(output).subarray(0, MAX_OUTPUT_BYTES).toString()}\n[output truncated at ${MAX_OUTPUT_BYTES} bytes; narrow the command]`;
-				}
-				const exitCode = error ? (typeof error.code === "number" ? error.code : 1) : 0;
-				if (error && typeof error.code !== "number") output += `\n[${error.message}]`;
-				resolvePromise({ exitCode, output, truncated });
-			},
-		);
+		// stdin is closed: with an open pipe, rg and cat without a path argument would wait for input.
+		const child = spawn(argv[0]!, argv.slice(1), {
+			cwd: root,
+			signal,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", PAGER: "cat", GIT_PAGER: "cat" },
+		});
+		const stdout = capture(child.stdout);
+		const stderr = capture(child.stderr);
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill();
+		}, COMMAND_TIMEOUT_MS);
+		let settled = false;
+		const finish = (exitCode: number, note?: string) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			const errors = stderr.text();
+			let output = `${stdout.text()}${errors ? `\n[stderr]\n${errors}` : ""}`;
+			const truncated = stdout.overflowed() || stderr.overflowed() || Buffer.byteLength(output) > MAX_OUTPUT_BYTES;
+			if (truncated) {
+				output = `${Buffer.from(output).subarray(0, MAX_OUTPUT_BYTES).toString()}\n[output truncated at ${MAX_OUTPUT_BYTES} bytes; narrow the command]`;
+			}
+			if (note) output += `\n[${note}]`;
+			resolvePromise({ exitCode, output, truncated });
+		};
+		child.on("error", (error) => finish(1, error.message));
+		child.on("close", (code, killSignal) => {
+			if (timedOut) finish(1, `timed out after ${COMMAND_TIMEOUT_MS / 1000} s; narrow the command`);
+			else finish(code ?? 1, code === null ? `terminated by ${killSignal}` : undefined);
+		});
 	});
 }
 
