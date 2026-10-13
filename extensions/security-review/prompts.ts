@@ -102,22 +102,29 @@ export function profilePrompt(scope: Scope): string {
 	].join("\n\n");
 }
 
+/**
+ * The text every hunt agent of a run shares (profile, then the diff or the class list) comes first and
+ * the agent's own header and assignment last, so the agents share a provider cache prefix.
+ */
 export function huntPrompt(profile: Profile | undefined, scope: Scope, assignment: HuntAssignment): string {
-	const parts = [header(`hunt:${assignment.label}`), profileSection(profile)];
+	const parts = [profileSection(profile)];
 	if (assignment.kind === "class") {
-		parts.push(
-			`## Assignment: ${assignment.title}\n\nHunt only for this class of issues in the changed code:\n\n${assignment.focus}\n\nOther agents cover the other classes. You may read any file in the project to trace data flow, but only report issues whose flaw is in, or is introduced or exposed by, the changes below.`,
-		);
 		parts.push(`## Changed files (${scope.files.length})\n\n${fileList(scope.files)}`);
 		if (scope.untracked?.length) parts.push(`New untracked files (not in the diff; read them directly):\n\n${fileList(scope.untracked)}`);
 		parts.push(
 			`## Diff against ${scope.baseRef} (merge-base ${scope.mergeBase?.slice(0, 12)})\n\n${scope.diffTruncated ? "The diff was truncated; read the changed files directly for the rest.\n\n" : ""}\`\`\`diff\n${scope.diff ?? ""}\n\`\`\``,
 		);
+		parts.push(
+			header(`hunt:${assignment.label}`),
+			`## Assignment: ${assignment.title}\n\nHunt only for this class of issues in the changed code:\n\n${assignment.focus}\n\nOther agents cover the other classes. You may read any file in the project to trace data flow, but only report issues whose flaw is in, or is introduced or exposed by, the changes above.`,
+		);
 	} else {
 		parts.push(
-			`## Assignment: ${assignment.title}\n\nAudit the files below for vulnerabilities of every class. Other agents own the rest of the project. You may read any file to trace data flow, but only report issues whose flaw is located in your files.\n\nClasses to consider:\n\n${VULN_CLASSES.map((c) => `- **${c.title}**: ${c.focus}`).join("\n")}`,
+			`## Vulnerability classes\n\n${VULN_CLASSES.map((c) => `- **${c.title}**: ${c.focus}`).join("\n")}`,
+			header(`hunt:${assignment.label}`),
+			`## Assignment: ${assignment.title}\n\nAudit the files below for vulnerabilities of every class listed above. Other agents own the rest of the project. You may read any file to trace data flow, but only report issues whose flaw is located in your files.`,
+			`## Your files (${assignment.files.length})\n\n${fileList(assignment.files)}`,
 		);
-		parts.push(`## Your files (${assignment.files.length})\n\n${fileList(assignment.files)}`);
 	}
 	return parts.join("\n\n");
 }
