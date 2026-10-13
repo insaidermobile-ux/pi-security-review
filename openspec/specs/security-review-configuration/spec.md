@@ -40,11 +40,15 @@ When a role's model is served by the `claude-bridge` provider and the bridge is 
 - **THEN** no prompt is registered and the agent runs as before
 
 ### Requirement: Exclude patterns narrow the scope
-The extension SHALL accept a list of glob patterns in its settings. Files matching any pattern SHALL be removed from the audited file set in both default and full modes.
+The extension SHALL accept a list of glob patterns in its settings. Files matching any pattern SHALL be removed from the audited file set in both default and full modes. A pattern without a slash SHALL also match by name at any depth, a pattern that matches a directory SHALL exclude everything below it, and wildcards SHALL match names that begin with a dot.
 
 #### Scenario: Vendor directory excluded
 - **WHEN** settings exclude a pattern matching a vendored dependency directory and that directory contains changed files
 - **THEN** those files are not in the audited file set
+
+#### Scenario: Dot-directory excluded
+- **WHEN** settings exclude `.github` or `**/*.json` and the changes include `.github/workflows/ci.yml` and `config/.eslintrc.json`
+- **THEN** neither file is in the audited file set
 
 ### Requirement: Run limits are configurable with defaults
 The extension SHALL expose settings for maximum concurrent agents, maximum hypotheses verified per run, and per-agent timeout. Each SHALL have a built-in default used when unset.

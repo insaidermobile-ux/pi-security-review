@@ -98,6 +98,10 @@ In default mode, the hunt stage SHALL partition work by vulnerability class, giv
 - **WHEN** a full-mode run enters the hunt stage
 - **THEN** each hunt agent receives one subtree of the project and hunts for all vulnerability classes within it
 
+#### Scenario: Sources under a chain of single directories
+- **WHEN** a full-mode run audits a project whose sources all sit below directory levels with a single child, such as `src/main/java/com/example/`
+- **THEN** an oversized subtree is still split at the first level that has several children
+
 ### Requirement: Duplicate hypotheses are merged before verification
 Hypotheses with the same vulnerability type and overlapping anchors SHALL be merged into one before the verify stage.
 
@@ -161,7 +165,7 @@ Verification agents SHALL reason from source code, configuration, and version hi
 - **THEN** no build, test, or application process of the audited project is started
 
 ### Requirement: Audit agents are read-only
-Every audit agent SHALL operate with a tool set that cannot create, modify, or delete files in the audited project and cannot execute arbitrary shell commands. Shell access, when provided, SHALL be limited to an allowlist of read-only inspection commands.
+Every audit agent SHALL operate with a tool set that cannot create, modify, or delete files in the audited project and cannot execute arbitrary shell commands. Shell access, when provided, SHALL be limited to an allowlist of read-only inspection commands. An option that makes an allowed command run another program or write a file SHALL be rejected in every spelling the command accepts, including unambiguous abbreviations of long options and short options combined in one argument.
 
 #### Scenario: Write attempt
 - **WHEN** an audit agent attempts to call a file-writing or editing tool
@@ -170,6 +174,32 @@ Every audit agent SHALL operate with a tool set that cannot create, modify, or d
 #### Scenario: Disallowed shell command
 - **WHEN** an audit agent attempts a shell command outside the read-only allowlist
 - **THEN** the command is rejected and not executed
+
+#### Scenario: Abbreviated option that runs a program
+- **WHEN** an audit agent runs `git grep` with an abbreviation of `--open-files-in-pager`
+- **THEN** the command is rejected and no program is started
+
+### Requirement: Audit agents read only inside the audited project
+Every tool that reads files SHALL be confined to the audited project: a path outside it, whether absolute, home-relative, reached through `..`, or reached through a symbolic link inside the project, SHALL be refused. Inspection commands SHALL NOT wait for standard input.
+
+#### Scenario: Read outside the project
+- **WHEN** an audit agent asks a read, search, or listing tool for a path outside the audited project, directly or through a symbolic link in the project
+- **THEN** the call fails with a message that the path is outside the project and nothing is read
+
+#### Scenario: Search without a path
+- **WHEN** an audit agent runs `rg` with a pattern and no path
+- **THEN** the project is searched and the command returns without waiting for input
+
+### Requirement: A verified hypothesis that cannot be recorded marks the run incomplete
+When verification confirms or downgrades a hypothesis but the resulting finding cannot be recorded, the pipeline SHALL list the hypothesis as unverified, report the reason, and mark the run incomplete, so that a full run does not mark findings stale on the strength of it.
+
+#### Scenario: Finding record fails validation
+- **WHEN** a hypothesis is confirmed and its finding record fails validation
+- **THEN** the hypothesis is listed as unverified with the reason and the run is incomplete
+
+#### Scenario: Vulnerability type in a non-Latin script
+- **WHEN** a hunt agent names the vulnerability type in a non-Latin script and the hypothesis is confirmed
+- **THEN** the type is kept and the finding is recorded
 
 ### Requirement: Agents run in isolated sessions
 Each audit agent SHALL run in its own session that is not persisted to the user's session list and is disposed when the agent finishes.

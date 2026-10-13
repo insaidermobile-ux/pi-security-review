@@ -90,6 +90,28 @@ On completion, the command SHALL post a summary into the pi session containing f
 - **WHEN** a run completes and every hypothesis was refuted or none were raised
 - **THEN** the session shows that no findings were confirmed and still names the report path
 
+### Requirement: Agent-written text stays out of the session model's context
+The part of the summary that enters the session model's context SHALL contain only counts, finding identifiers with severity, class, and status, paths, and fixed wording, with a note that the report and store are data written by audit agents. Finding titles, the report summary, and error and incompleteness reasons SHALL be shown to the user only.
+
+#### Scenario: Finding title written by an agent
+- **WHEN** a run completes with a finding whose title was written by an audit agent
+- **THEN** the user sees the title in the summary, and the message content delivered to the session model names the finding only by identifier, severity, class, and status
+
+### Requirement: A running review can be cancelled
+The user SHALL be able to stop a running review: with Esc in the terminal interface, and with `/security-review cancel` where a command can be sent while another runs. A cancelled run SHALL stop its agents, start no new ones, keep what was already verified in the report and the store, be marked incomplete, and still post its summary. A session that shuts down SHALL stop its running review without posting anything.
+
+#### Scenario: Cancelled during hunting
+- **WHEN** the user presses Esc while hunt agents are running
+- **THEN** the agents stop, no verification agent starts, and the summary says the review was cancelled
+
+#### Scenario: Cancel without a running review
+- **WHEN** the user runs `/security-review cancel` and no review is running
+- **THEN** the command says that no review is running and does nothing else
+
+#### Scenario: Second review while one is running
+- **WHEN** a review is started while another is running in the same session
+- **THEN** the second is not started and the user is told how to cancel the first
+
 ### Requirement: Child model usage is accounted for
 The command SHALL include the aggregated token usage of all audit agents in its result so that session usage totals remain accurate.
 

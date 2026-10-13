@@ -107,6 +107,28 @@ Each run SHALL record refuted hypotheses with the challenger's reasoning in the 
 - **WHEN** the challenger refutes a hypothesis
 - **THEN** the store's refuted list for that run contains the hypothesis, the affirmer argument, and the challenger reasoning
 
+### Requirement: A store changed by the branch under review is not trusted
+The store and the cached profile hold the user's own decisions and are given to agents as trusted context. When `findings.json` or `profile.json` is tracked by git and differs between the review base (the merge base with the default branch) and `HEAD`, the run SHALL stop before any model call, name the files, and say how to restore them or stop tracking them.
+
+#### Scenario: Branch marks a finding as a false positive
+- **WHEN** a commit on the branch under review changes a tracked `findings.json`
+- **THEN** the run stops with an error naming the file and no agent is started
+
+#### Scenario: Tracked but unchanged, or untracked
+- **WHEN** the store files are untracked, or tracked and identical to the review base
+- **THEN** the run proceeds
+
+### Requirement: Results are stored before the report summary and on top of the current store
+The run SHALL write the report and merge its findings into the store before the summary agent runs, so that a failure or interruption after verification loses only the summary. The merge SHALL start from the store as it is at that moment, not as it was when the run started. When the store cannot be read at that moment, the run SHALL keep its results in the run log and say where.
+
+#### Scenario: Status edited during the run
+- **WHEN** the user changes a finding's status in `findings.json` while a run is in progress
+- **THEN** the status is still there after the run
+
+#### Scenario: Summary agent fails
+- **WHEN** the summary agent fails or never returns
+- **THEN** `findings.json` and `report.md` already contain the run's findings
+
 ### Requirement: Store is written atomically
 Updates to `findings.json` SHALL be written so that an interrupted run leaves either the previous content or the new content, never a truncated file.
 
