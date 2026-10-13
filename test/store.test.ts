@@ -5,8 +5,10 @@ import { describe, test } from "node:test";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
 import type { Finding, RunRecord, ScopeMode } from "../extensions/security-review/schema.ts";
 import {
+	assertStoreTrusted,
 	emptyStore,
 	gitignoreHint,
+	isStoreIgnored,
 	loadCachedProfile,
 	loadStore,
 	mergeRun,
@@ -21,7 +23,7 @@ import {
 	storePath,
 } from "../extensions/security-review/store.ts";
 import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
-import { commitAll, makeRepo, write } from "./git-fixtures.ts";
+import { commitAll, makeRepo, sh, write } from "./git-fixtures.ts";
 import { tempDir } from "./temp.ts";
 
 function newFinding(overrides: Partial<NewFinding> & { function?: string; line?: number } = {}): NewFinding {
@@ -337,20 +339,71 @@ describe("profile cache", () => {
 	});
 });
 
+describe("store trust", () => {
+	const FINDINGS = ".security-review/findings.json";
+	const mergeBase = (root: string) => sh(root, "merge-base", "main", "HEAD").trim();
+
+	test("an untracked store is trusted", async () => {
+		const root = makeRepo();
+		sh(root, "checkout", "-q", "-b", "feature");
+		saveStore(root, emptyStore());
+		await assertStoreTrusted({ root, mergeBase: mergeBase(root) });
+	});
+
+	test("a tracked store changed by commits on the branch is refused in both modes", async () => {
+		const root = makeRepo();
+		sh(root, "checkout", "-q", "-b", "feature");
+		saveStore(root, emptyStore());
+		saveProfile(root, "fp", { summary: "s", stack: ["js"], entry_points: [], trust_boundaries: [], auth_model: "none", external_inputs: [] }, "now");
+		sh(root, "add", "-f", ".security-review");
+		commitAll(root, "add a store");
+		for (const scope of [{ root, mergeBase: mergeBase(root) }, { root }]) {
+			await assert.rejects(assertStoreTrusted(scope), (error: unknown) => {
+				assert.ok(error instanceof StoreError);
+				assert.match(error.message, /findings\.json and \.security-review\/profile\.json are tracked by git and changed by commits on this branch/);
+				return true;
+			});
+		}
+	});
+
+	test("a tracked store from the default branch stays trusted, including local edits", async () => {
+		const root = makeRepo();
+		saveStore(root, emptyStore());
+		sh(root, "add", "-f", FINDINGS);
+		commitAll(root, "track the store");
+		sh(root, "checkout", "-q", "-b", "feature");
+		write(root, "src/a.ts", "1\n");
+		commitAll(root, "feature work");
+		// The extension's own uncommitted update of the store.
+		saveStore(root, { ...emptyStore(), gitignore_hint_shown: true });
+		await assertStoreTrusted({ root, mergeBase: mergeBase(root) });
+		await assertStoreTrusted({ root });
+	});
+
+	test("a tracked store is trusted when there is no default branch to compare with", async () => {
+		const root = makeRepo();
+		sh(root, "branch", "-m", "main", "trunk");
+		saveStore(root, emptyStore());
+		sh(root, "add", "-f", FINDINGS);
+		commitAll(root, "track the store");
+		await assertStoreTrusted({ root });
+	});
+});
+
 describe("gitignore hint", () => {
 	test("recommends ignoring once when the directory is not ignored", async () => {
 		const root = makeRepo();
-		const first = await gitignoreHint(root, emptyStore());
+		const first = gitignoreHint(emptyStore(), await isStoreIgnored(root));
 		assert.match(first.hint!, /\.security-review\/.*\.gitignore/);
 		assert.equal(first.store.gitignore_hint_shown, true);
-		const second = await gitignoreHint(root, first.store);
+		const second = gitignoreHint(first.store, await isStoreIgnored(root));
 		assert.equal(second.hint, undefined);
 	});
 
 	test("shows nothing when the directory is ignored", async () => {
 		for (const pattern of [".security-review/", ".security-review", "/.security-review/*"]) {
 			const root = makeRepo({ ".gitignore": `${pattern}\n` });
-			const { hint, store } = await gitignoreHint(root, emptyStore());
+			const { hint, store } = gitignoreHint(emptyStore(), await isStoreIgnored(root));
 			assert.equal(hint, undefined, pattern);
 			assert.equal(store.gitignore_hint_shown, false);
 		}

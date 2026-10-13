@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { normalizePath, normalizeVulnType } from "./fingerprint.ts";
-import { git, STORE_DIR } from "./scope.ts";
+import { git, resolveBaseRef, type Scope, STORE_DIR } from "./scope.ts";
 import { type Anchor, type Finding, type Profile, ProfileInput, type RunRecord, type StoreFile, StoreFile as StoreFileSchema, validate } from "./schema.ts";
 
 export { STORE_DIR };
@@ -46,6 +46,39 @@ export function loadStore(root: string): StoreFile {
 		throw new StoreError(`${path} does not match the findings store schema:\n${errors.slice(0, 10).join("\n")}\nFix or remove it and run again.`);
 	}
 	return data as StoreFile;
+}
+
+/** The commit where the current branch left the default branch, or undefined when there is no default branch to compare with. */
+async function defaultBranchMergeBase(root: string): Promise<string | undefined> {
+	try {
+		const result = await git(root, ["merge-base", await resolveBaseRef(root), "HEAD"]);
+		return result.code === 0 ? result.stdout.trim() || undefined : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The store holds the user's own decisions and is trusted as such: a false-positive status is shown to
+ * the challenger and survives a confirmed finding, and the cached profile is given to every agent. A
+ * store file that git tracks and that the commits under review changed was written by the author of
+ * those commits instead, who could use it to hide a finding. Such a run is refused before any model call.
+ * Uncommitted changes are local and stay trusted.
+ */
+export async function assertStoreTrusted(scope: Pick<Scope, "root" | "mergeBase">): Promise<void> {
+	const files = [FINDINGS_FILE, PROFILE_FILE].map((file) => `${STORE_DIR}/${file}`);
+	const tracked = (await git(scope.root, ["ls-files", "-z", "--", ...files])).stdout.split("\0").filter(Boolean);
+	if (tracked.length === 0) return;
+	const base = scope.mergeBase ?? (await defaultBranchMergeBase(scope.root));
+	if (!base) return;
+	const changed = (await git(scope.root, ["diff", "-z", "--name-only", base, "HEAD", "--", ...tracked])).stdout.split("\0").filter(Boolean);
+	if (changed.length === 0) return;
+	const short = base.slice(0, 12);
+	throw new StoreError(
+		`${changed.join(" and ")} ${changed.length === 1 ? "is" : "are"} tracked by git and changed by commits on this branch (since ${short}). ` +
+			"/security-review trusts these files as your own triage decisions, so a branch that changes them could hide findings from its own review. " +
+			`Restore them from the base (git checkout ${short} -- ${STORE_DIR}) or stop tracking them (git rm -r --cached ${STORE_DIR}, then add ${STORE_DIR}/ to .gitignore), and run again.`,
+	);
 }
 
 export interface AtomicWriteHooks {
@@ -228,7 +261,6 @@ export function mergeRun(previous: StoreFile, input: MergeInput): MergeResult {
 	return { store: { ...previous, findings, runs }, run, observed: [...observed.values()], added, updated, markedStale, staleSkipped };
 }
 
-/** A stored finding the user marked as a false positive with the same fingerprint, if any. */
 /** Stored false-positive findings matching the given hypotheses under the same rules as mergeRun, by hypothesis id. */
 export function priorFalsePositives(
 	store: StoreFile,
@@ -294,11 +326,10 @@ export async function isStoreIgnored(root: string): Promise<boolean> {
 
 /**
  * The once-per-project recommendation to ignore `.security-review/`, or undefined when it is already
- * ignored or was shown before. Marks the hint as shown in the returned store.
+ * ignored (see isStoreIgnored) or was shown before. Marks the hint as shown in the returned store.
  */
-export async function gitignoreHint(root: string, store: StoreFile): Promise<{ hint?: string; store: StoreFile }> {
-	if (await isStoreIgnored(root)) return { store };
-	if (store.gitignore_hint_shown) return { store };
+export function gitignoreHint(store: StoreFile, ignored: boolean): { hint?: string; store: StoreFile } {
+	if (ignored || store.gitignore_hint_shown) return { store };
 	return {
 		hint: `\`${STORE_DIR}/\` is not ignored by git. Add it to .gitignore to keep findings out of commits: echo '${STORE_DIR}/' >> .gitignore`,
 		store: { ...store, gitignore_hint_shown: true },

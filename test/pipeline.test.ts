@@ -10,10 +10,10 @@ import { VULN_CLASSES } from "../extensions/security-review/prompts.ts";
 import type { AffirmArgument, Hypothesis, HypothesisInput } from "../extensions/security-review/schema.ts";
 import { resolveScope } from "../extensions/security-review/scope.ts";
 import { DEFAULT_SETTINGS, ROLES } from "../extensions/security-review/settings.ts";
-import { loadStore, saveStore } from "../extensions/security-review/store.ts";
+import { loadStore, saveStore, StoreError, storePath } from "../extensions/security-review/store.ts";
 import { failTimes, fauxAssistantMessage, fauxToolCall, hang, inTurn, providerError, RATE_LIMITED, type ScriptStep, scriptedRuntime } from "./faux.ts";
 import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
-import { makeFixtureRepo, makeRepo, sh } from "./git-fixtures.ts";
+import { commitAll, makeFixtureRepo, makeRepo, sh } from "./git-fixtures.ts";
 
 const PROFILE = {
 	summary: "Express API with user search and file download.",
@@ -158,7 +158,6 @@ describe("hunt partitioning", () => {
 
 		const angular = Array.from({ length: 900 }, (_, i) => `src/app/feature${i % 20}/c${i}.ts`);
 		assert.ok(subtreePartitions(angular).length > 1);
-
 		// Files in a single directory cannot be split further.
 		const flat = Array.from({ length: 400 }, (_, i) => `a/b/c/f${i}.ts`);
 		assert.deepEqual(subtreePartitions(flat).map((g) => g.files.length), [400]);
@@ -617,5 +616,69 @@ describe("end-to-end with scripted model responses", () => {
 		const env = await setup(fixtureScripts());
 		await assert.rejects(runPipeline(await resolveScope(root, "diff"), env.makeDeps(root)), /not valid JSON/);
 		assert.equal(env.calls.length, 0);
+	});
+
+	test("a store changed by the commits under review stops the run before any model call", async () => {
+		const root = makeFixtureRepo();
+		const first = await setup(fixtureScripts());
+		await runPipeline(await resolveScope(root, "diff"), first.makeDeps(root));
+		// The branch author commits a store that dismisses the finding.
+		const store = loadStore(root);
+		store.findings[0]!.status = "false-positive";
+		saveStore(root, store);
+		sh(root, "add", "-f", ".security-review/findings.json");
+		commitAll(root, "hide the finding");
+
+		const second = await setup(fixtureScripts());
+		await assert.rejects(runPipeline(await resolveScope(root, "diff"), second.makeDeps(root)), (error: unknown) => {
+			assert.ok(error instanceof StoreError);
+			assert.match(error.message, /\.security-review\/findings\.json .*tracked by git and changed by commits on this branch/);
+			assert.match(error.message, /git rm -r --cached \.security-review/);
+			return true;
+		});
+		assert.equal(second.calls.length, 0);
+	});
+
+	test("a status set while the run is in progress survives it", async () => {
+		const root = makeFixtureRepo();
+		const first = await setup(fixtureScripts());
+		await runPipeline(await resolveScope(root, "diff"), first.makeDeps(root));
+
+		const scripts = fixtureScripts();
+		const confirm = scripts["Agent: challenger:H-001"]![0]!;
+		// The user triages the stored finding while the agents are still working.
+		scripts["Agent: challenger:H-001"] = [
+			(context, options, state, model) => {
+				const store = loadStore(root);
+				store.findings[0]!.status = "accepted-risk";
+				saveStore(root, store);
+				return typeof confirm === "function" ? confirm(context, options, state, model) : confirm;
+			},
+		];
+		const second = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), second.makeDeps(root));
+		assert.deepEqual(result.findings.map((f) => [f.id, f.status]), [["SR-001", "accepted-risk"]]);
+		assert.equal(loadStore(root).findings[0]!.status, "accepted-risk");
+		assert.equal(loadStore(root).runs.length, 2);
+	});
+
+	test("results are stored before the summary agent runs", async () => {
+		const root = makeFixtureRepo();
+		const scripts = fixtureScripts();
+		const summarize = scripts["Agent: report"]![0]!;
+		let before: { findings: number; report: string } | undefined;
+		scripts["Agent: report"] = [
+			(context, options, state, model) => {
+				before = { findings: loadStore(root).findings.length, report: readFileSync(storePath(root, "report.md"), "utf8") };
+				return typeof summarize === "function" ? summarize(context, options, state, model) : summarize;
+			},
+		];
+		const env = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(before?.findings, 1);
+		assert.match(before!.report, /SR-001: User search endpoint/);
+		assert.doesNotMatch(before!.report, /## Summary/);
+		assert.match(readFileSync(result.reportPath, "utf8"), /## Summary\n\nOne SQL injection in user search\./);
+		assert.equal((JSON.parse(readFileSync(result.runLogPath, "utf8")) as { summary?: string }).summary, "One SQL injection in user search.");
 	});
 });

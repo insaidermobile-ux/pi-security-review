@@ -15,13 +15,16 @@ import {
 	type Profile,
 	type RefutedHypothesis,
 	type RunRecord,
+	type StoreFile,
 	validate,
 } from "./schema.ts";
 import { introducedIn, type Scope } from "./scope.ts";
 import type { Role, SecurityReviewSettings } from "./settings.ts";
 import {
+	assertStoreTrusted,
 	FINDINGS_FILE,
 	gitignoreHint,
+	isStoreIgnored,
 	loadCachedProfile,
 	loadStore,
 	mergeRun,
@@ -31,6 +34,7 @@ import {
 	REPORT_FILE,
 	saveProfile,
 	saveStore,
+	StoreError,
 	storePath,
 	writeFileAtomic,
 	writeRunLog,
@@ -378,8 +382,9 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	const now = deps.now ?? (() => new Date());
 	const started = now();
 	const id = runId(started);
-	// Load first: an unreadable store stops the run before any model call and is never overwritten.
-	const previousStore = loadStore(scope.root);
+	// Checked and loaded first: an untrusted or unreadable store stops the run before any model call and is never overwritten.
+	await assertStoreTrusted(scope);
+	const storeAtStart = loadStore(scope.root);
 	const agents: AgentOutcome[] = [];
 	const incomplete: string[] = [];
 	const errors: string[] = [];
@@ -397,41 +402,82 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	errors.push(...hunt.errors);
 	if (hunt.overflow.length) incomplete.push(`${hunt.overflow.length} hypotheses over the cap of ${deps.settings.maxHypotheses} were not verified`);
 
-	const priors = priorFalsePositives(previousStore, hunt.verify);
+	const priors = priorFalsePositives(storeAtStart, hunt.verify);
 	const verified = await verifyStage(scope, profileResult.profile, hunt.verify, (h) => priors.get(h.id), deps, agents);
 	const newFindings: NewFinding[] = [];
 	const refuted: RefutedHypothesis[] = [];
 	const unverified: Hypothesis[] = [...hunt.overflow];
 	const verifyFailures: AgentOutcome[] = [];
+	let invalid = 0;
 	for (const result of verified) {
 		if (result.kind === "finding") newFindings.push(result.finding);
 		else if (result.kind === "refuted") refuted.push(result.refuted);
-		else if (result.kind === "unverified") {
+		else {
 			unverified.push(result.hypothesis);
-			verifyFailures.push(result.failure);
-		} else errors.push(result.reason);
+			if (result.kind === "unverified") verifyFailures.push(result.failure);
+			else {
+				invalid++;
+				errors.push(result.reason);
+			}
+		}
 	}
 	incomplete.push(...failureReasons("verification", verifyFailures));
+	// A verified hypothesis that could not be recorded was not accounted for: the run must not count as a complete observation.
+	if (invalid) incomplete.push(`${invalid} verified ${invalid === 1 ? "hypothesis" : "hypotheses"} could not be recorded as ${invalid === 1 ? "a finding" : "findings"} (see Errors)`);
 
 	deps.onProgress?.({ stage: "report" });
 	const finished = now();
-	const merged = mergeRun(previousStore, {
-		run: {
-			id,
-			mode: scope.mode,
-			...(scope.baseRef ? { base_ref: scope.baseRef } : {}),
-			started_at: started.toISOString(),
-			finished_at: finished.toISOString(),
-			files: scope.files.length,
-			complete: incomplete.length === 0,
-			incomplete_reasons: incomplete,
-			refuted,
-			unverified,
-			errors,
-		},
-		findings: newFindings,
-		now: finished.toISOString(),
-	});
+	const run = {
+		id,
+		mode: scope.mode,
+		...(scope.baseRef ? { base_ref: scope.baseRef } : {}),
+		started_at: started.toISOString(),
+		finished_at: finished.toISOString(),
+		files: scope.files.length,
+		complete: incomplete.length === 0,
+		incomplete_reasons: incomplete,
+		refuted,
+		unverified,
+		errors,
+	};
+	const logDetails = {
+		scope: { mode: scope.mode, base_ref: scope.baseRef, merge_base: scope.mergeBase, files: scope.files },
+		profile: profileResult.profile,
+		profile_cached: profileResult.cached,
+		hypotheses: hunt.all,
+		verification: verified.map((result) => ({
+			hypothesis_id: result.hypothesis.id,
+			outcome: result.kind,
+			...(result.kind === "finding" ? { verdict: result.finding.verification.verdict } : {}),
+			...(priors.get(result.hypothesis.id) ? { prior_false_positive: priors.get(result.hypothesis.id)!.id } : {}),
+		})),
+	};
+	const agentLog = () => agents.map(({ label, ok, timedOut, error, transient, rejected, usage }) => ({ label, ok, timedOut, error, transient, rejected, usage }));
+
+	// The store is read again rather than reused from the start of the run: the user may have triaged
+	// findings, or another run may have finished, while the agents worked. Reading, merging, and saving
+	// happen without yielding in between.
+	const ignored = await isStoreIgnored(scope.root);
+	let current: StoreFile;
+	try {
+		current = loadStore(scope.root);
+	} catch (error) {
+		// The store became unreadable during the run. It is not overwritten; the run log keeps the results.
+		const rescued = writeRunLog(scope.root, { ...run, finding_ids: [], ...logDetails, findings: newFindings, agents: agentLog() });
+		throw new StoreError(`${(error as Error).message}\nThis run's results were not merged into the store; they are kept in ${rescued}.`);
+	}
+	const merged = mergeRun(current, { run, findings: newFindings, now: finished.toISOString() });
+	const hint = gitignoreHint(merged.store, ignored);
+	saveStore(scope.root, hint.store);
+
+	// The report and run log are written before the summary agent runs, so interrupting it loses only the summary.
+	const reportPath = storePath(scope.root, REPORT_FILE);
+	const writeOutputs = (summary?: string) => {
+		writeFileAtomic(reportPath, renderReport({ run: merged.run, scope, findings: merged.observed, refuted, unverified, summary }));
+		return writeRunLog(scope.root, { ...merged.run, ...logDetails, agents: agentLog(), summary });
+	};
+	let runLogPath = writeOutputs();
+
 	let summary: string | undefined;
 	if (merged.observed.length > 0 || refuted.length > 0) {
 		const collector: { summary?: string } = {};
@@ -463,30 +509,10 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 		);
 		agents.push(outcome);
 		summary = collector.summary;
+		// Recorded in the report and the run log; the store was saved before the summary agent ran.
 		if (!summary) errors.push(`report summary unavailable (${describeFailure(outcome)})`);
+		runLogPath = writeOutputs(summary);
 	}
-
-	const hint = await gitignoreHint(scope.root, merged.store);
-	saveStore(scope.root, hint.store);
-
-	const reportPath = storePath(scope.root, REPORT_FILE);
-	writeFileAtomic(reportPath, renderReport({ run: merged.run, scope, findings: merged.observed, refuted, unverified, summary }));
-	const runLogPath = writeRunLog(scope.root, {
-		...merged.run,
-		errors,
-		scope: { mode: scope.mode, base_ref: scope.baseRef, merge_base: scope.mergeBase, files: scope.files },
-		profile: profileResult.profile,
-		profile_cached: profileResult.cached,
-		hypotheses: hunt.all,
-		verification: verified.map((result) => ({
-			hypothesis_id: result.hypothesis.id,
-			outcome: result.kind,
-			...(result.kind === "finding" ? { verdict: result.finding.verification.verdict } : {}),
-			...(priors.get(result.hypothesis.id) ? { prior_false_positive: priors.get(result.hypothesis.id)!.id } : {}),
-		})),
-		agents: agents.map(({ label, ok, timedOut, error, transient, rejected, usage }) => ({ label, ok, timedOut, error, transient, rejected, usage })),
-		summary,
-	});
 
 	return {
 		run: merged.run,
