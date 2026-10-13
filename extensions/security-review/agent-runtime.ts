@@ -1,0 +1,206 @@
+import type { Api, AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
+import {
+	type AgentSession,
+	createAgentSession,
+	createExtensionRuntime,
+	getAgentDir,
+	ModelRuntime,
+	type ResourceLoader,
+	SessionManager,
+	SettingsManager,
+	type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { Role } from "./settings.ts";
+import { createShellTool } from "./shell.ts";
+
+type ThinkingLevel = NonNullable<Parameters<typeof createAgentSession>[0]>["thinkingLevel"];
+
+/** Built-in tools that only read. `write`, `edit`, and `bash` are never given to audit agents. */
+export const READ_ONLY_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
+
+export function emptyUsage(): Usage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+}
+
+export function addUsage(target: Usage, usage: Usage): void {
+	target.input += usage.input;
+	target.output += usage.output;
+	target.cacheRead += usage.cacheRead;
+	target.cacheWrite += usage.cacheWrite;
+	target.totalTokens += usage.totalTokens;
+	target.cost.input += usage.cost.input;
+	target.cost.output += usage.cost.output;
+	target.cost.cacheRead += usage.cost.cacheRead;
+	target.cost.cacheWrite += usage.cost.cacheWrite;
+	target.cost.total += usage.cost.total;
+}
+
+export interface UsageRecord {
+	provider: string;
+	model: string;
+	usage: Usage;
+}
+
+/** Usage of all audit agents, grouped by provider and model. */
+export class UsageLedger {
+	private readonly byModel = new Map<string, UsageRecord>();
+
+	add(provider: string, model: string, usage: Usage): void {
+		const key = `${provider}/${model}`;
+		let record = this.byModel.get(key);
+		if (!record) {
+			record = { provider, model, usage: emptyUsage() };
+			this.byModel.set(key, record);
+		}
+		addUsage(record.usage, usage);
+	}
+
+	entries(): UsageRecord[] {
+		return [...this.byModel.values()];
+	}
+
+	total(): Usage {
+		const total = emptyUsage();
+		for (const record of this.byModel.values()) addUsage(total, record.usage);
+		return total;
+	}
+}
+
+export interface AgentSpec {
+	/** Unique label for progress and logs, e.g. "hunt:injection" or "challenger:H-003". */
+	label: string;
+	role: Role;
+	model: Model<Api>;
+	systemPrompt: string;
+	prompt: string;
+	/** Submission tools for this role. */
+	tools: ToolDefinition[];
+	/** Whether the agent has submitted what it owes. */
+	done: () => boolean;
+	/** Sent once when the agent stops without submitting. */
+	nudge?: string;
+}
+
+export interface AgentOutcome {
+	label: string;
+	ok: boolean;
+	timedOut: boolean;
+	error?: string;
+	usage: Usage;
+}
+
+export interface AgentRunner {
+	run(spec: AgentSpec, signal?: AbortSignal): Promise<AgentOutcome>;
+}
+
+export interface SdkRunnerOptions {
+	/** Audited project root; agent tools resolve paths against it. */
+	root: string;
+	modelRuntime: ModelRuntime;
+	thinkingLevel?: ThinkingLevel;
+	timeoutMs: number;
+	ledger: UsageLedger;
+}
+
+function isolatedResources(systemPrompt: string): ResourceLoader {
+	return {
+		getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+		getSkills: () => ({ skills: [], diagnostics: [] }),
+		getPrompts: () => ({ prompts: [], diagnostics: [] }),
+		getThemes: () => ({ themes: [], diagnostics: [] }),
+		getAgentsFiles: () => ({ agentsFiles: [] }),
+		getSystemPrompt: () => systemPrompt,
+		getSystemPromptSource: () => undefined,
+		getAppendSystemPrompt: () => [],
+		getAppendSystemPromptSources: () => [],
+		extendResources: () => {},
+		reload: async () => {},
+	};
+}
+
+/**
+ * Create an isolated, read-only, in-memory session for one audit agent: no extensions, skills,
+ * context files, or user settings; only read-only built-ins, the restricted shell, and the role's
+ * submission tools.
+ */
+export async function createAuditSession(options: SdkRunnerOptions, spec: Pick<AgentSpec, "model" | "systemPrompt" | "tools">): Promise<AgentSession> {
+	const customTools = [createShellTool(options.root) as unknown as ToolDefinition, ...spec.tools];
+	const { session } = await createAgentSession({
+		cwd: options.root,
+		agentDir: getAgentDir(),
+		model: spec.model,
+		thinkingLevel: options.thinkingLevel,
+		modelRuntime: options.modelRuntime,
+		resourceLoader: isolatedResources(spec.systemPrompt),
+		tools: [...READ_ONLY_BUILTIN_TOOLS, ...customTools.map((tool) => tool.name)],
+		customTools,
+		sessionManager: SessionManager.inMemory(options.root),
+		settingsManager: SettingsManager.inMemory({ retry: { enabled: true, maxRetries: 3 } }),
+	});
+	return session;
+}
+
+function lastAssistantError(session: AgentSession): string | undefined {
+	for (let i = session.messages.length - 1; i >= 0; i--) {
+		const message = session.messages[i] as AssistantMessage;
+		if (message?.role !== "assistant") continue;
+		return message.stopReason === "error" ? message.errorMessage || "model request failed" : undefined;
+	}
+	return undefined;
+}
+
+export function createSdkAgentRunner(options: SdkRunnerOptions): AgentRunner {
+	return {
+		async run(spec, signal) {
+			const usage = emptyUsage();
+			let timedOut = false;
+			let session: AgentSession | undefined;
+			let timer: NodeJS.Timeout | undefined;
+			const onAbort = () => void session?.abort();
+			try {
+				if (signal?.aborted) return { label: spec.label, ok: false, timedOut: false, error: "cancelled", usage };
+				session = await createAuditSession(options, spec);
+				session.subscribe((event) => {
+					if (event.type !== "message_end" || event.message.role !== "assistant") return;
+					const message = event.message as AssistantMessage;
+					if (!message.usage) return;
+					addUsage(usage, message.usage);
+					options.ledger.add(message.provider ?? spec.model.provider, message.model ?? spec.model.id, message.usage);
+				});
+				signal?.addEventListener("abort", onAbort, { once: true });
+				timer = setTimeout(() => {
+					timedOut = true;
+					void session?.abort();
+				}, options.timeoutMs);
+
+				await session.prompt(spec.prompt);
+				if (!spec.done() && !timedOut && !signal?.aborted && spec.nudge) await session.prompt(spec.nudge);
+
+				if (timedOut) return { label: spec.label, ok: false, timedOut, error: `timed out after ${Math.round(options.timeoutMs / 1000)}s`, usage };
+				if (signal?.aborted) return { label: spec.label, ok: false, timedOut, error: "cancelled", usage };
+				const error = lastAssistantError(session);
+				if (error) return { label: spec.label, ok: false, timedOut, error, usage };
+				if (!spec.done()) return { label: spec.label, ok: false, timedOut, error: "finished without submitting a result", usage };
+				return { label: spec.label, ok: true, timedOut, usage };
+			} catch (error) {
+				return { label: spec.label, ok: false, timedOut, error: (error as Error).message, usage };
+			} finally {
+				if (timer) clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				session?.dispose();
+			}
+		},
+	};
+}
+
+/**
+ * The model runtime of the parent pi session, so audit agents share its credentials and any providers
+ * registered by other extensions. Falls back to a runtime built from the standard auth and model files.
+ */
+export async function resolveModelRuntime(modelRegistry: unknown): Promise<ModelRuntime> {
+	const candidate = (modelRegistry as { runtime?: unknown } | undefined)?.runtime as Partial<ModelRuntime> | undefined;
+	if (candidate && typeof candidate.getModel === "function" && typeof candidate.streamSimple === "function" && typeof candidate.getAuth === "function") {
+		return candidate as ModelRuntime;
+	}
+	return ModelRuntime.create();
+}

@@ -1,0 +1,319 @@
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { describe, test } from "node:test";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { type AgentOutcome, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
+import { applyHypothesisCap, huntAssignments, mergeDuplicateHypotheses, subtreePartitions } from "../extensions/security-review/partition.ts";
+import { huntStage, type PipelineDeps, profileStage, type Progress, runPipeline, verifyHypothesis } from "../extensions/security-review/pipeline.ts";
+import { VULN_CLASSES } from "../extensions/security-review/prompts.ts";
+import type { AffirmArgument, Hypothesis, HypothesisInput } from "../extensions/security-review/schema.ts";
+import { resolveScope } from "../extensions/security-review/scope.ts";
+import { DEFAULT_SETTINGS, ROLES } from "../extensions/security-review/settings.ts";
+import { loadStore, saveStore } from "../extensions/security-review/store.ts";
+import { fauxAssistantMessage, fauxToolCall, hang, type ScriptStep, scriptedRuntime } from "./faux.ts";
+import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
+import { makeFixtureRepo, makeRepo, sh } from "./git-fixtures.ts";
+
+const PROFILE = {
+	summary: "Express API with user search and file download.",
+	stack: ["javascript", "express", "pg"],
+	entry_points: [{ location: "src/server.js:10", description: "GET /files" }],
+	trust_boundaries: ["anonymous vs authenticated user"],
+	auth_model: "Bearer session tokens via requireUser",
+	external_inputs: ["query parameters"],
+};
+
+const SQLI: HypothesisInput = hypothesisInput({
+	anchors: [{ file: "src/users.js", line: 6, function: "searchUsers" }],
+	suspected_sink: "db.query with concatenated SQL",
+	severity_estimate: "high",
+});
+const TRAVERSAL: HypothesisInput = hypothesisInput({
+	anchors: [{ file: "src/files.js", line: 9, function: "download" }],
+	claim: "name is resolved against the upload root and streamed",
+	vuln_type: "path-traversal",
+	cwe: "CWE-22",
+	suspected_sink: "fs.createReadStream",
+	severity_estimate: "medium",
+});
+
+const submit = (tool: string, args: object) => fauxAssistantMessage(fauxToolCall(tool, args as Parameters<typeof fauxToolCall>[1]));
+const say = (text: string) => fauxAssistantMessage(text);
+
+async function setup(scripts: Record<string, ScriptStep[]>, options: { timeoutMs?: number; settings?: Partial<typeof DEFAULT_SETTINGS> } = {}) {
+	const faux = await scriptedRuntime(scripts);
+	const ledger = new UsageLedger();
+	const progress: Progress[] = [];
+	const makeDeps = (root: string): PipelineDeps => ({
+		runner: createSdkAgentRunner({ root, modelRuntime: faux.runtime, timeoutMs: options.timeoutMs ?? 20_000, ledger }),
+		models: Object.fromEntries(ROLES.map((role) => [role, faux.model])) as Record<(typeof ROLES)[number], Model<Api>>,
+		settings: { ...DEFAULT_SETTINGS, ...options.settings },
+		onProgress: (p) => progress.push(p),
+	});
+	return { ...faux, ledger, progress, makeDeps };
+}
+
+/** Scripts for a full fixture run: SQL injection confirmed, guarded traversal refuted, duplicate merged. */
+function fixtureScripts(): Record<string, ScriptStep[]> {
+	return {
+		"Agent: profile": [submit("submit_profile", PROFILE)],
+		"Agent: hunt:injection": [submit("submit_hypothesis", SQLI), say("one finding")],
+		"Agent: hunt:access-control": [submit("submit_hypothesis", { ...SQLI, anchors: [{ file: "src/users.js", line: 7, function: "searchUsers" }], severity_estimate: "medium" }), say("done")],
+		"Agent: hunt:files-deserialization": [submit("submit_hypothesis", TRAVERSAL), say("done")],
+		"Agent: affirmer:H-001": [submit("submit_argument", affirm("H-001", { attack_path: [{ location: "src/users.js:6", description: "name concatenated into SQL" }] }))],
+		"Agent: challenger:H-001": [submit("submit_argument", challenge("H-001", "confirmed"))],
+		"Agent: affirmer:H-002": [submit("submit_argument", affirm("H-002", { component: "File download (src/files.js)", consequence: "reading arbitrary files" }))],
+		"Agent: challenger:H-002": [
+			submit("submit_argument", challenge("H-002", "refuted", { defenses_found: [{ defense: "resolve and prefix check", location: "src/files.js:9", effect: "blocks" }] })),
+		],
+		"Agent: report": [submit("submit_summary", { summary: "One SQL injection in user search." })],
+	};
+}
+
+describe("profile stage", () => {
+	test("reuses the cached profile in default mode without a model call", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup({ "Agent: profile": [submit("submit_profile", PROFILE)] });
+		const scope = await resolveScope(root, "diff");
+		const agents: AgentOutcome[] = [];
+		const first = await profileStage(scope, env.makeDeps(root), agents);
+		assert.equal(first.cached, false);
+		assert.deepEqual(first.profile, PROFILE);
+		const callsAfterFirst = env.calls.length;
+		const second = await profileStage(scope, env.makeDeps(root), agents);
+		assert.equal(second.cached, true);
+		assert.deepEqual(second.profile, PROFILE);
+		assert.equal(env.calls.length, callsAfterFirst, "no model call for the cached profile");
+		assert.deepEqual(env.progress.at(-1), { stage: "profile", cached: true });
+	});
+
+	test("refreshes the profile in full mode", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup({ "Agent: profile": [submit("submit_profile", PROFILE)] });
+		const agents: AgentOutcome[] = [];
+		await profileStage(await resolveScope(root, "diff"), env.makeDeps(root), agents);
+		const calls = env.calls.length;
+		const full = await profileStage(await resolveScope(root, "full"), env.makeDeps(root), agents);
+		assert.equal(full.cached, false);
+		assert.ok(env.calls.length > calls);
+	});
+});
+
+describe("hunt partitioning", () => {
+	test("default mode partitions by vulnerability class over the whole scope", async () => {
+		const scope = await resolveScope(makeFixtureRepo(), "diff");
+		const assignments = huntAssignments(scope);
+		assert.deepEqual(assignments.map((a) => a.label), VULN_CLASSES.map((c) => c.id));
+		for (const assignment of assignments) {
+			assert.equal(assignment.kind, "class");
+			assert.deepEqual(assignment.files, scope.files);
+		}
+	});
+
+	test("full mode partitions by subtree with every file owned exactly once", () => {
+		const files = [
+			...Array.from({ length: 320 }, (_, i) => `src/api/v${i % 4}/file${i}.ts`),
+			...Array.from({ length: 40 }, (_, i) => `src/ui/c${i}.tsx`),
+			...Array.from({ length: 5 }, (_, i) => `scripts/s${i}.sh`),
+			"README.md",
+			"package.json",
+		];
+		const groups = subtreePartitions(files);
+		assert.ok(groups.length > 1 && groups.length <= 12, `${groups.length} groups`);
+		assert.deepEqual(groups.flatMap((g) => g.files).sort(), [...files].sort());
+		assert.ok(groups.every((g) => g.files.length <= 150 || !g.label.includes("+")));
+		assert.ok(groups.some((g) => g.label.startsWith("src/api/")), groups.map((g) => g.label).join(", "));
+	});
+
+	test("full mode on a small project uses one subtree agent", async () => {
+		const scope = await resolveScope(makeFixtureRepo(), "full");
+		const assignments = huntAssignments(scope);
+		assert.equal(assignments.length, 1);
+		assert.equal(assignments[0]!.kind, "subtree");
+		assert.deepEqual(assignments[0]!.files, scope.files);
+	});
+
+	test("duplicates with the same type and overlapping anchors are merged", () => {
+		const merged = mergeDuplicateHypotheses([
+			{ ...SQLI, source_partition: "injection", severity_estimate: "medium" },
+			{ ...SQLI, anchors: [{ file: "src/users.js", line: 40, function: "searchUsers" }], severity_estimate: "high", source_partition: "access-control" },
+			{ ...SQLI, vuln_type: "xss", source_partition: "injection" },
+			{ ...SQLI, anchors: [{ file: "src/users.js", line: 9 }], source_partition: "injection" },
+			{ ...SQLI, anchors: [{ file: "src/other.js", line: 6 }], source_partition: "injection" },
+		]);
+		assert.equal(merged.length, 3);
+		assert.equal(merged[0]!.severity_estimate, "high");
+		assert.equal(merged[0]!.source_partition, "injection, access-control");
+		assert.equal(merged[0]!.anchors.length, 3);
+	});
+
+	test("the cap keeps the most severe hypotheses", () => {
+		const { verify, overflow } = applyHypothesisCap(
+			[
+				{ id: "a", severity_estimate: "low" },
+				{ id: "b", severity_estimate: "critical" },
+				{ id: "c", severity_estimate: "medium" },
+				{ id: "d", severity_estimate: "critical" },
+			],
+			2,
+		);
+		assert.deepEqual(verify.map((h) => h.id), ["b", "d"]);
+		assert.deepEqual(overflow.map((h) => h.id), ["c", "a"]);
+	});
+
+	test("hunt stage merges duplicates, assigns deterministic ids, and reports overflow", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup(fixtureScripts(), { settings: { maxHypotheses: 1 } });
+		const agents: AgentOutcome[] = [];
+		const hunt = await huntStage(await resolveScope(root, "diff"), PROFILE, env.makeDeps(root), agents);
+		assert.deepEqual(hunt.all.map((h) => [h.id, h.vuln_type]), [
+			["H-001", "sql-injection"],
+			["H-002", "path-traversal"],
+		]);
+		assert.deepEqual(hunt.verify.map((h) => h.id), ["H-001"]);
+		assert.deepEqual(hunt.overflow.map((h) => h.id), ["H-002"]);
+		assert.equal(agents.length, 6);
+		assert.deepEqual(env.progress.at(-1), { stage: "hunt", done: 6, total: 6 });
+	});
+});
+
+describe("verify stage", () => {
+	async function verifyWith(verdict: "confirmed" | "downgraded" | "refuted") {
+		const root = makeFixtureRepo();
+		const env = await setup({
+			"Agent: affirmer:H-001": [submit("submit_argument", affirm("H-001"))],
+			"Agent: challenger:H-001": [submit("submit_argument", challenge("H-001", verdict))],
+		});
+		const hypothesis: Hypothesis = { ...SQLI, id: "H-001", source_partition: "injection", fingerprint: "fp1" };
+		const scope = await resolveScope(root, "diff");
+		const result = await verifyHypothesis(scope, PROFILE, hypothesis, undefined, env.makeDeps(root), []);
+		return { result, env, root };
+	}
+
+	test("the challenger receives the affirmer's complete argument after the affirmer finishes", async () => {
+		const { env } = await verifyWith("confirmed");
+		const order = env.calls.filter((c) => c.endsWith("#0"));
+		assert.deepEqual(order, ["Agent: affirmer:H-001#0", "Agent: challenger:H-001#0"]);
+		const challengerPrompt = env.prompts.get("Agent: challenger:H-001")!;
+		const argument: AffirmArgument = affirm("H-001");
+		assert.ok(challengerPrompt.includes("## Affirmer's argument"));
+		assert.ok(challengerPrompt.includes(JSON.stringify(argument, null, 2)));
+	});
+
+	test("confirmed maps to a vulnerability finding", async () => {
+		const { result, root } = await verifyWith("confirmed");
+		assert.equal(result.kind, "finding");
+		if (result.kind !== "finding") return;
+		assert.equal(result.finding.finding_class, "vulnerability");
+		assert.equal(result.finding.verification.verdict, "confirmed");
+		assert.equal(result.finding.title, "User search endpoint (src/users.ts): sql injection leading to reading any user's records");
+		assert.equal(result.finding.introduced_in, sh(root, "rev-parse", "HEAD").trim());
+	});
+
+	test("downgraded maps to a risk finding", async () => {
+		const { result } = await verifyWith("downgraded");
+		assert.equal(result.kind, "finding");
+		if (result.kind === "finding") assert.equal(result.finding.finding_class, "risk");
+	});
+
+	test("refuted is recorded with both arguments", async () => {
+		const { result } = await verifyWith("refuted");
+		assert.equal(result.kind, "refuted");
+		if (result.kind === "refuted") assert.equal(result.refuted.challenger.verdict, "refuted");
+	});
+
+	test("a prior false-positive verdict is passed to the challenger", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup({
+			"Agent: affirmer:H-001": [submit("submit_argument", affirm("H-001"))],
+			"Agent: challenger:H-001": [submit("submit_argument", challenge("H-001", "refuted"))],
+		});
+		const hypothesis: Hypothesis = { ...SQLI, id: "H-001", source_partition: "injection", fingerprint: "fp1" };
+		const prior = {
+			id: "SR-007",
+			title: "Old title",
+			verification: { challenger: challenge("H-009", "confirmed", { reasoning: "UNIQUE-PRIOR-REASONING" }) },
+		} as never;
+		await verifyHypothesis(await resolveScope(root, "diff"), PROFILE, hypothesis, prior, env.makeDeps(root), []);
+		const prompt = env.prompts.get("Agent: challenger:H-001")!;
+		assert.match(prompt, /Previous verdict: false positive/);
+		assert.match(prompt, /SR-007/);
+		assert.match(prompt, /UNIQUE-PRIOR-REASONING/);
+	});
+});
+
+describe("end-to-end with scripted model responses", () => {
+	test("produces store, report, summary, and aggregated usage", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup(fixtureScripts());
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+
+		assert.equal(result.run.complete, true, result.run.incomplete_reasons.join("; "));
+		assert.equal(result.hypotheses.length, 2);
+		assert.deepEqual(result.findings.map((f) => [f.id, f.finding_class, f.severity, f.status]), [["SR-001", "vulnerability", "high", "open"]]);
+		assert.equal(result.refuted.length, 1);
+		assert.equal(result.refuted[0]!.hypothesis.vuln_type, "path-traversal");
+		assert.deepEqual(result.counts, { critical: 0, high: 1, medium: 0, low: 0 });
+		assert.equal(result.summary, "One SQL injection in user search.");
+		assert.match(result.gitignoreHint!, /not ignored/);
+
+		const store = loadStore(root);
+		assert.equal(store.findings.length, 1);
+		assert.equal(store.runs.length, 1);
+		assert.equal(store.runs[0]!.refuted.length, 1);
+		assert.equal(store.gitignore_hint_shown, true);
+		const report = readFileSync(result.reportPath, "utf8");
+		assert.match(report, /SR-001: User search endpoint/);
+		assert.match(report, /## Refuted hypotheses[\s\S]*H-002/);
+		assert.match(report, /One SQL injection in user search\./);
+		assert.ok(existsSync(result.runLogPath));
+		assert.equal(sh(root, "status", "--porcelain").includes(".security-review"), true, "store is untracked, never staged");
+		assert.equal(sh(root, "diff", "--cached", "--name-only").trim(), "");
+
+		const total = env.ledger.total().totalTokens;
+		assert.ok(total > 0);
+		assert.equal(total, result.agents.reduce((sum, a) => sum + a.usage.totalTokens, 0));
+		assert.deepEqual(env.progress.map((p) => p.stage).filter((s, i, all) => s !== all[i - 1]), ["profile", "hunt", "verify", "report"]);
+	});
+
+	test("a re-run keeps a false-positive status and passes the prior verdict to the challenger", async () => {
+		const root = makeFixtureRepo();
+		const first = await setup(fixtureScripts());
+		await runPipeline(await resolveScope(root, "diff"), first.makeDeps(root));
+		const store = loadStore(root);
+		store.findings[0]!.status = "false-positive";
+		saveStore(root, store);
+
+		const second = await setup(fixtureScripts());
+		const result = await runPipeline(await resolveScope(root, "diff"), second.makeDeps(root));
+		assert.equal(loadStore(root).findings[0]!.status, "false-positive");
+		assert.equal(result.findings[0]!.id, "SR-001");
+		assert.match(second.prompts.get("Agent: challenger:H-001")!, /Previous verdict: false positive/);
+		assert.equal(result.gitignoreHint, undefined, "hint shown once per project");
+	});
+
+	test("a failing hunt agent marks the run incomplete while other results proceed", async () => {
+		const root = makeFixtureRepo();
+		const scripts = fixtureScripts();
+		scripts["Agent: hunt:network-ssrf"] = [hang];
+		const env = await setup(scripts, { timeoutMs: 3000 });
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(result.run.complete, false);
+		assert.ok(result.run.incomplete_reasons.some((r) => r.includes("hunt:network-ssrf") && r.includes("timed out")), result.run.incomplete_reasons.join("; "));
+		assert.equal(result.findings.length, 1);
+		assert.equal(result.refuted.length, 1);
+		assert.match(readFileSync(result.reportPath, "utf8"), /Incomplete run/);
+	});
+
+	test("an invalid store stops the run before any model call", async () => {
+		const root = makeRepo();
+		sh(root, "checkout", "-q", "-b", "feature");
+		const { writeFileSync, mkdirSync } = await import("node:fs");
+		writeFileSync(`${root}/a.js`, "1\n");
+		mkdirSync(`${root}/.security-review`);
+		writeFileSync(`${root}/.security-review/findings.json`, "{ broken");
+		const env = await setup(fixtureScripts());
+		await assert.rejects(runPipeline(await resolveScope(root, "diff"), env.makeDeps(root)), /not valid JSON/);
+		assert.equal(env.calls.length, 0);
+	});
+});
