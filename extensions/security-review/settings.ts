@@ -5,7 +5,7 @@
 
 export const SETTINGS_KEY = "securityReview";
 
-export const ROLES = ["profile", "hunt", "affirmer", "challenger", "report"] as const;
+export const ROLES = ["profile", "hunt", "triage", "affirmer", "challenger", "report"] as const;
 export type Role = (typeof ROLES)[number];
 
 export interface SecurityReviewSettings {

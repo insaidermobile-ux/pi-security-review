@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { normalizePath, normalizeVulnType } from "./fingerprint.ts";
 import { git, STORE_DIR } from "./scope.ts";
-import { type Finding, type Profile, ProfileInput, type RunRecord, type StoreFile, StoreFile as StoreFileSchema, validate } from "./schema.ts";
+import { type Anchor, type Finding, type Profile, ProfileInput, type RunRecord, type StoreFile, StoreFile as StoreFileSchema, validate } from "./schema.ts";
 
 export { STORE_DIR };
 export const FINDINGS_FILE = "findings.json";
@@ -99,6 +100,64 @@ export interface MergeResult {
 	added: number;
 	updated: number;
 	markedStale: number;
+	/** True for an incomplete full-mode run: unobserved findings may simply not have been checked. */
+	staleSkipped: boolean;
+}
+
+/** What identifies an observation for matching against stored findings. */
+export interface MatchKey {
+	fingerprint: string;
+	vuln_type: string;
+	/** Primary anchor file. */
+	file: string;
+}
+
+export function matchKey(item: { fingerprint: string; vuln_type: string; anchors: readonly Anchor[] }): MatchKey {
+	return { fingerprint: item.fingerprint, vuln_type: item.vuln_type, file: item.anchors[0]?.file ?? "" };
+}
+
+function typeAndFile(key: { vuln_type: string; file: string }): string {
+	return `${normalizeVulnType(key.vuln_type)}\0${normalizePath(key.file)}`;
+}
+
+/**
+ * Match observations to stored findings: first by exact fingerprint, then, for what is left on both
+ * sides, by vulnerability type and primary file when that pairing is unambiguous (one stored finding
+ * and one distinct fingerprint among the observations). Models describe the same issue's function and
+ * sink differently between runs; type and file are the stable part. Returns incoming index -> finding.
+ */
+export function matchStored(stored: readonly Finding[], incoming: readonly MatchKey[]): Map<number, Finding> {
+	const matches = new Map<number, Finding>();
+	const byFingerprint = new Map(stored.map((finding) => [finding.fingerprint, finding]));
+	incoming.forEach((key, index) => {
+		const exact = byFingerprint.get(key.fingerprint);
+		if (exact) matches.set(index, exact);
+	});
+
+	const taken = new Set(matches.values());
+	const storedByKey = new Map<string, Finding[]>();
+	for (const finding of stored) {
+		if (taken.has(finding)) continue;
+		const key = typeAndFile({ vuln_type: finding.vuln_type, file: finding.anchors[0]?.file ?? "" });
+		storedByKey.set(key, [...(storedByKey.get(key) ?? []), finding]);
+	}
+	const incomingByKey = new Map<string, number[]>();
+	incoming.forEach((key, index) => {
+		if (matches.has(index)) return;
+		const groupKey = typeAndFile(key);
+		incomingByKey.set(groupKey, [...(incomingByKey.get(groupKey) ?? []), index]);
+	});
+	for (const [groupKey, indexes] of incomingByKey) {
+		const candidates = storedByKey.get(groupKey) ?? [];
+		const fingerprints = new Set(indexes.map((index) => incoming[index]!.fingerprint));
+		if (candidates.length === 1 && fingerprints.size === 1) for (const index of indexes) matches.set(index, candidates[0]!);
+	}
+	return matches;
+}
+
+/** An incomplete full-mode run does not mark findings stale: unobserved findings may simply not have been checked. */
+export function staleMarkingSkipped(run: Pick<RunRecord, "mode" | "complete">): boolean {
+	return run.mode === "full" && !run.complete;
 }
 
 function nextId(findings: readonly Finding[]): () => string {
@@ -108,20 +167,23 @@ function nextId(findings: readonly Finding[]): () => string {
 }
 
 /**
- * Merge a run's findings into the store: deduplicate by fingerprint, keep ids and user-set statuses,
- * refresh evidence, and in full mode mark open findings that were not observed again as stale.
+ * Merge a run's findings into the store: deduplicate (see matchStored), keep ids and user-set statuses,
+ * refresh evidence, and after a complete full-mode run mark open findings that were not observed again as stale.
  */
 export function mergeRun(previous: StoreFile, input: MergeInput): MergeResult {
 	const findings = previous.findings.map((finding) => ({ ...finding }));
-	const byFingerprint = new Map(findings.map((finding) => [finding.fingerprint, finding]));
+	const matches = matchStored(findings, input.findings.map(matchKey));
+	// Findings created earlier in this run, for repeats within the same run.
+	const createdByFingerprint = new Map<string, Finding>();
 	const allocate = nextId(findings);
 	const observed = new Map<string, Finding>();
 	let added = 0;
 	let updated = 0;
 
-	for (const incoming of input.findings) {
-		const existing = byFingerprint.get(incoming.fingerprint);
+	for (const [index, incoming] of input.findings.entries()) {
+		const existing = matches.get(index) ?? createdByFingerprint.get(incoming.fingerprint);
 		if (existing) {
+			// Takes the incoming fingerprint too, so a fallback match follows the latest description.
 			const status = USER_STATUSES.has(existing.status) ? existing.status : "open";
 			Object.assign(existing, incoming, {
 				id: existing.id,
@@ -131,19 +193,22 @@ export function mergeRun(previous: StoreFile, input: MergeInput): MergeResult {
 				introduced_in: existing.introduced_in ?? incoming.introduced_in,
 			});
 			if (existing.introduced_in === undefined) delete existing.introduced_in;
+			// Consequences describe this observation; an observation without them clears the old list.
+			if (!incoming.consequences) delete existing.consequences;
 			if (!observed.has(existing.id)) updated++;
 			observed.set(existing.id, existing);
 		} else {
 			const finding: Finding = { ...incoming, id: allocate(), status: "open", first_seen: input.now, last_seen: input.now };
 			findings.push(finding);
-			byFingerprint.set(finding.fingerprint, finding);
+			createdByFingerprint.set(finding.fingerprint, finding);
 			observed.set(finding.id, finding);
 			added++;
 		}
 	}
 
 	let markedStale = 0;
-	if (input.run.mode === "full") {
+	const staleSkipped = staleMarkingSkipped(input.run);
+	if (input.run.mode === "full" && !staleSkipped) {
 		for (const finding of findings) {
 			if (finding.status === "open" && !observed.has(finding.id)) {
 				finding.status = "stale";
@@ -154,12 +219,20 @@ export function mergeRun(previous: StoreFile, input: MergeInput): MergeResult {
 
 	const run: RunRecord = { ...input.run, finding_ids: [...observed.keys()] };
 	const runs = [...previous.runs, run].slice(-MAX_STORED_RUNS);
-	return { store: { ...previous, findings, runs }, run, observed: [...observed.values()], added, updated, markedStale };
+	return { store: { ...previous, findings, runs }, run, observed: [...observed.values()], added, updated, markedStale, staleSkipped };
 }
 
 /** A stored finding the user marked as a false positive with the same fingerprint, if any. */
-export function priorFalsePositive(store: StoreFile, fingerprint: string): Finding | undefined {
-	return store.findings.find((finding) => finding.fingerprint === fingerprint && finding.status === "false-positive");
+/** Stored false-positive findings matching the given hypotheses under the same rules as mergeRun, by hypothesis id. */
+export function priorFalsePositives(
+	store: StoreFile,
+	hypotheses: readonly { id: string; fingerprint: string; vuln_type: string; anchors: readonly Anchor[] }[],
+): Map<string, Finding> {
+	const priors = new Map<string, Finding>();
+	for (const [index, finding] of matchStored(store.findings, hypotheses.map(matchKey))) {
+		if (finding.status === "false-positive") priors.set(hypotheses[index]!.id, finding);
+	}
+	return priors;
 }
 
 // Profile cache

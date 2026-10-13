@@ -21,6 +21,7 @@ describe("status text", () => {
 		assert.equal(statusText("scope"), "security-review: scope");
 		assert.equal(statusText({ stage: "profile", cached: true }), "security-review: profile (cached)");
 		assert.equal(statusText({ stage: "hunt", done: 3, total: 6 }), "security-review: hunt 3/6");
+		assert.equal(statusText({ stage: "triage" }), "security-review: triage");
 		assert.equal(statusText({ stage: "verify", done: 7, total: 12 }), "security-review: verify 7/12");
 		assert.equal(statusText({ stage: "report" }), "security-review: report");
 	});
@@ -59,6 +60,22 @@ describe("session summary", () => {
 		assert.match(text, /SR-001 \[high vulnerability\] Search: sql injection leading to data theft - `a\.js:3`/);
 		assert.match(text, /Report: `\.security-review\/report\.md` · Findings: `\.security-review\/findings\.json`/);
 		assert.match(text, /Usage: 1,000 tokens across 9 agents/);
+		assert.doesNotMatch(text, /consequence/);
+	});
+
+	test("counts consequences next to a finding", () => {
+		const consequence = { vuln_type: "secret-disclosure", description: "d", anchors: [{ file: "a.js", line: 3 }] };
+		const base: Partial<Finding> = { id: "SR-001", severity: "high", finding_class: "vulnerability", title: "T", anchors: [{ file: "a.js", line: 3 }] };
+		const text = formatSummary(
+			result([
+				{ ...base, status: "false-positive", consequences: [consequence] },
+				{ ...base, id: "SR-002", status: "open", consequences: [consequence, consequence] },
+			]),
+			"/repo",
+			"u",
+		);
+		assert.match(text, /SR-001 \[high vulnerability\] T - `a\.js:3` \(\+1 consequence\) \(false-positive\)/);
+		assert.match(text, /SR-002 .* \(\+2 consequences\)$/m);
 	});
 
 	test("says no findings were confirmed and still names the report", () => {
@@ -74,7 +91,10 @@ describe("session summary", () => {
 			"u",
 		);
 		assert.match(text, /\*\*Incomplete run:\*\* hunt agent failed \(x\)/);
+		assert.doesNotMatch(text, /Stale marking skipped/);
 		assert.match(text, /HINT$/);
+		const full = result([], { run: { ...result([]).run, mode: "full", complete: false, incomplete_reasons: ["hunt agent failed (x)"] } });
+		assert.match(formatSummary(full, "/repo", "u"), /hunt agent failed \(x\)\nStale marking skipped: the run was incomplete\./);
 	});
 });
 

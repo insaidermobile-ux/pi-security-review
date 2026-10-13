@@ -1,6 +1,9 @@
 import type { Finding, RefutedHypothesis, RunRecord, Severity } from "./schema.ts";
 import { SEVERITIES } from "./schema.ts";
 import type { Scope } from "./scope.ts";
+import { staleMarkingSkipped } from "./store.ts";
+
+export const STALE_SKIPPED_NOTE = "Stale marking skipped: the run was incomplete.";
 
 export interface ReportInput {
 	run: RunRecord;
@@ -21,6 +24,10 @@ export function countBySeverity(findings: readonly Finding[]): SeverityCounts {
 
 function anchorText(anchor: Finding["anchors"][number]): string {
 	return `\`${anchor.file}:${anchor.line}\`${anchor.function ? ` (${anchor.function})` : ""}`;
+}
+
+function consequenceLines(consequences: Finding["consequences"]): string[] {
+	return (consequences ?? []).map((c) => `- ${c.vuln_type} at ${c.anchors.map(anchorText).join(", ")}: ${c.description}`);
 }
 
 function fence(text: string, language = ""): string {
@@ -57,6 +64,7 @@ function renderFinding(finding: Finding): string {
 		"",
 		...finding.data_flow.map((step, i) => `${i + 1}. \`${step.location}\`: ${step.description}`),
 		"",
+		...(finding.consequences?.length ? ["**Consequences** (removed by the same fix)", "", ...consequenceLines(finding.consequences), ""] : []),
 		"<details><summary>Verification</summary>",
 		"",
 		"**Affirmer**",
@@ -99,6 +107,7 @@ export function renderReport(input: ReportInput): string {
 		`- By severity: ${SEVERITIES.map((s) => `${counts[s]} ${s}`).join(", ")}`,
 	];
 	if (!run.complete) lines.push(`- **Incomplete run:** ${run.incomplete_reasons.join("; ")}`);
+	if (staleMarkingSkipped(run)) lines.push(`- ${STALE_SKIPPED_NOTE}`);
 	lines.push("");
 	if (input.summary) lines.push("## Summary", "", input.summary.trim(), "");
 
@@ -125,13 +134,17 @@ export function renderReport(input: ReportInput): string {
 			`**Why it was refuted** (confidence ${entry.challenger.confidence}): ${entry.challenger.reasoning}`,
 			"",
 		);
+		if (h.consequences?.length) lines.push("**Consequences, refuted with it:**", "", ...consequenceLines(h.consequences), "");
 		const blocking = entry.challenger.defenses_found.filter((d) => d.effect !== "none");
 		if (blocking.length) lines.push(...blocking.map((d) => `- ${d.defense} at \`${d.location}\` (${d.effect})`), "");
 	}
 
 	if (input.unverified.length > 0) {
 		lines.push("## Unverified hypotheses", "", "These were raised but not verified in this run (cap reached or an agent failed).", "");
-		for (const h of input.unverified) lines.push(`- ${h.id} [${h.severity_estimate}] ${h.vuln_type} at ${h.anchors.map(anchorText).join(", ")}: ${h.claim}`);
+		for (const h of input.unverified) {
+			const extra = h.consequences?.length ? ` (consequences: ${h.consequences.map((c) => c.vuln_type).join(", ")})` : "";
+			lines.push(`- ${h.id} [${h.severity_estimate}] ${h.vuln_type} at ${h.anchors.map(anchorText).join(", ")}: ${h.claim}${extra}`);
+		}
 		lines.push("");
 	}
 	if (run.errors.length > 0) lines.push("## Errors", "", ...run.errors.map((e) => `- ${e}`), "");

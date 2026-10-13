@@ -79,12 +79,43 @@ export const HypothesisInput = Type.Object(
 );
 export type HypothesisInput = Static<typeof HypothesisInput>;
 
+/** An issue that disappears with the fix for the primary issue it is attached to (see triage). */
+export const Consequence = Type.Object(
+	{
+		vuln_type: Text("Vulnerability type of the consequence"),
+		description: Text("What the consequence is and how it follows from the primary issue"),
+		anchors: Type.Array(Anchor, { minItems: 1 }),
+	},
+	{ additionalProperties: false },
+);
+export type Consequence = Static<typeof Consequence>;
+
 export interface Hypothesis extends HypothesisInput {
 	id: string;
 	/** Label of the hunt partition that produced it. */
 	source_partition: string;
 	fingerprint: string;
+	/** Other hypotheses folded into this one by triage because the same fix removes them. */
+	consequences?: Consequence[];
 }
+
+export const TriageInput = Type.Object(
+	{
+		groups: Type.Array(
+			Type.Object(
+				{
+					primary: Text('Label of the root-cause candidate, e.g. "C-1"'),
+					members: Type.Array(Type.String(), { description: "Labels of every candidate in the group, including the primary" }),
+					reason: Text("Why fixing the primary removes every other member"),
+				},
+				{ additionalProperties: false },
+			),
+			{ description: "Groups of candidates that share a root cause; an empty list when nothing should be merged" },
+		),
+	},
+	{ additionalProperties: false },
+);
+export type TriageInput = Static<typeof TriageInput>;
 
 export const MissingDefense = Type.Object(
 	{
@@ -184,6 +215,7 @@ export const Finding = Type.Object({
 	remediation: AffirmArgument.properties.remediation,
 	scope: ScopeMode,
 	introduced_in: Type.Optional(Type.String()),
+	consequences: Type.Optional(Type.Array(Consequence)),
 	status: FindingStatus,
 	first_seen: Type.String(),
 	last_seen: Type.String(),
@@ -195,6 +227,7 @@ export const StoredHypothesis = Type.Object({
 	source_partition: Type.String(),
 	fingerprint: Type.String(),
 	...HypothesisInput.properties,
+	consequences: Type.Optional(Type.Array(Consequence)),
 });
 
 export const RefutedHypothesis = Type.Object({

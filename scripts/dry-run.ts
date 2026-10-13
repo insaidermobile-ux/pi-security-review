@@ -1,7 +1,7 @@
 /**
  * Dry-run individual audit roles against the vulnerable-app fixture with a real model.
  *
- *   node scripts/dry-run.ts [profile|hunt|verify|all] [--model provider/id] [--thinking low]
+ *   node scripts/dry-run.ts [profile|hunt|triage|verify|all] [--model provider/id] [--thinking low]
  *
  * Uses pi's configured credentials and default model unless --model is given. Exits non-zero when a
  * role's output is invalid or misses the expected result.
@@ -10,12 +10,13 @@ import { getAgentDir, ModelRuntime, SettingsManager } from "@earendil-works/pi-c
 import { type AgentOutcome, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
 import { profileStage, type PipelineDeps } from "../extensions/security-review/pipeline.ts";
-import { huntPrompt, systemPrompt, VULN_CLASSES } from "../extensions/security-review/prompts.ts";
-import { type AffirmArgument, AffirmArgument as AffirmSchema, type ChallengeArgument, ChallengeArgument as ChallengeSchema, type Hypothesis, type Profile, ProfileInput, validate } from "../extensions/security-review/schema.ts";
+import { huntPrompt, systemPrompt, triagePrompt, VULN_CLASSES } from "../extensions/security-review/prompts.ts";
+import { candidateLabel } from "../extensions/security-review/partition.ts";
+import { type AffirmArgument, AffirmArgument as AffirmSchema, type ChallengeArgument, ChallengeArgument as ChallengeSchema, type Hypothesis, type HypothesisInput, type Profile, ProfileInput, validate } from "../extensions/security-review/schema.ts";
 import { resolveScope } from "../extensions/security-review/scope.ts";
 import { DEFAULT_SETTINGS, ROLES } from "../extensions/security-review/settings.ts";
 import { affirmerPrompt, challengerPrompt } from "../extensions/security-review/prompts.ts";
-import { createAffirmTool, createChallengeTool, createHypothesisTool, type HypothesisCollector } from "../extensions/security-review/submit-tools.ts";
+import { createAffirmTool, createChallengeTool, createHypothesisTool, createTriageTool, type HypothesisCollector, type TriageCollector } from "../extensions/security-review/submit-tools.ts";
 import { makeFixtureRepo } from "../test/git-fixtures.ts";
 
 const args = process.argv.slice(2);
@@ -79,6 +80,60 @@ if (which === "hunt" || which === "all") {
 		collector.hypotheses.some((h) => h.anchors.some((a) => a.file === "src/users.js") && /sql/i.test(h.vuln_type)),
 		"hunt: SQL injection hypothesis anchored in src/users.js",
 	);
+}
+
+if (which === "triage" || which === "all") {
+	const candidates: HypothesisInput[] = [
+		{
+			anchors: [{ file: "src/users.js", line: 6, function: "searchUsers" }],
+			claim: "req.query.name is concatenated into the SQL LIKE clause passed to db.query",
+			vuln_type: "sql-injection",
+			suspected_source: "query parameter name on GET /users/search",
+			suspected_sink: "db.query with concatenated SQL",
+			severity_estimate: "high",
+		},
+		{
+			anchors: [{ file: "src/users.js", line: 6, function: "searchUsers" }],
+			claim: "A UNION payload in name makes the search return other columns of the users table, such as session digests, in the JSON response",
+			vuln_type: "secret-disclosure",
+			suspected_source: "query parameter name on GET /users/search",
+			suspected_sink: "res.json(rows) returning injected columns",
+			severity_estimate: "critical",
+		},
+		{
+			anchors: [{ file: "src/server.js", line: 11 }],
+			claim: "GET /users/search is registered without requireUser, unlike the other routes",
+			vuln_type: "missing-authz",
+			suspected_source: "anonymous HTTP request",
+			suspected_sink: "users.searchUsers returning user records",
+			severity_estimate: "medium",
+		},
+		{
+			anchors: [{ file: "src/users.js", line: 4, function: "searchUsers" }],
+			claim: "No rate limit on user search allows bulk enumeration of the directory",
+			vuln_type: "missing-rate-limit",
+			suspected_source: "repeated HTTP requests",
+			suspected_sink: "db.query per request",
+			severity_estimate: "low",
+		},
+	];
+	const labels = candidates.map((_, i) => candidateLabel(i));
+	const collector: TriageCollector = {};
+	const outcome = await runner.run({
+		label: "triage",
+		role: "triage",
+		model,
+		systemPrompt: systemPrompt("triage"),
+		prompt: triagePrompt(profile, candidates, labels),
+		tools: [createTriageTool(labels, collector)],
+		done: () => collector.groups !== undefined,
+		nudge: "Call submit_triage now.",
+	});
+	console.log(JSON.stringify(collector.groups, null, 2));
+	check(outcome.ok && collector.groups !== undefined, `triage: valid grouping submitted (${outcome.error ?? "ok"})`);
+	const groups = collector.groups ?? [];
+	check(groups.some((g) => g.primary === "C-1" && g.members.includes("C-2")), "triage: secret disclosure grouped under the SQL injection");
+	check(!groups.some((g) => g.members.includes("C-1") && (g.members.includes("C-3") || g.members.includes("C-4"))), "triage: missing authz and rate limit stay separate from the injection");
 }
 
 const sqli: Hypothesis = {

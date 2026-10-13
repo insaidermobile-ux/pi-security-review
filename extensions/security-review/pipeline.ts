@@ -2,9 +2,9 @@ import { randomBytes } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentOutcome, AgentRunner } from "./agent-runtime.ts";
 import { fingerprint, formatTitle, normalizeVulnType } from "./fingerprint.ts";
-import { applyHypothesisCap, huntAssignments, mergeDuplicateHypotheses, type TaggedHypothesis } from "./partition.ts";
+import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, type TaggedHypothesis } from "./partition.ts";
 import { mapBounded } from "./pool.ts";
-import { affirmerPrompt, challengerPrompt, huntPrompt, profilePrompt, reportPrompt, systemPrompt } from "./prompts.ts";
+import { affirmerPrompt, challengerPrompt, huntPrompt, profilePrompt, reportPrompt, systemPrompt, triagePrompt } from "./prompts.ts";
 import { countBySeverity, renderReport, type SeverityCounts } from "./report.ts";
 import {
 	type AffirmArgument,
@@ -26,7 +26,7 @@ import {
 	loadStore,
 	mergeRun,
 	type NewFinding,
-	priorFalsePositive,
+	priorFalsePositives,
 	projectFingerprint,
 	REPORT_FILE,
 	saveProfile,
@@ -42,13 +42,16 @@ import {
 	createHypothesisTool,
 	createProfileTool,
 	createSummaryTool,
+	createTriageTool,
 	type HypothesisCollector,
 	type ProfileCollector,
+	type TriageCollector,
 } from "./submit-tools.ts";
 
 export type Progress =
 	| { stage: "profile"; cached?: boolean }
 	| { stage: "hunt"; done: number; total: number }
+	| { stage: "triage" }
 	| { stage: "verify"; done: number; total: number }
 	| { stage: "report" };
 
@@ -121,13 +124,45 @@ export async function profileStage(scope: Scope, deps: PipelineDeps, agents: Age
 	return { cached: false, failure: describeFailure(outcome) };
 }
 
-/** Hunt stage: parallel agents per partition, then merge duplicates, assign ids, and apply the cap. */
+/**
+ * Triage stage: one agent groups candidates that a single fix removes. Without at least two candidates
+ * nothing runs; without a valid grouping the candidates proceed unchanged and the error is returned.
+ */
+export async function triageStage(
+	profile: Profile | undefined,
+	candidates: TaggedHypothesis[],
+	deps: PipelineDeps,
+	agents: AgentOutcome[],
+): Promise<{ candidates: TaggedHypothesis[]; error?: string }> {
+	if (candidates.length < 2) return { candidates };
+	deps.onProgress?.({ stage: "triage" });
+	const labels = candidates.map((_, i) => candidateLabel(i));
+	const collector: TriageCollector = {};
+	const outcome = await deps.runner.run(
+		{
+			label: "triage",
+			role: "triage",
+			model: deps.models.triage,
+			systemPrompt: systemPrompt("triage"),
+			prompt: triagePrompt(profile, candidates, labels),
+			tools: [createTriageTool(labels, collector)],
+			done: () => collector.groups !== undefined,
+			nudge: "You have not submitted the triage yet. Call submit_triage now, with an empty groups list if nothing should be merged.",
+		},
+		deps.signal,
+	);
+	agents.push(outcome);
+	if (!collector.groups) return { candidates, error: `triage unavailable, hypotheses were verified separately (${describeFailure(outcome)})` };
+	return { candidates: applyTriageGroups(candidates, collector.groups) };
+}
+
+/** Hunt stage: parallel agents per partition, then merge duplicates, triage, apply the cap, and assign ids. */
 export async function huntStage(
 	scope: Scope,
 	profile: Profile | undefined,
 	deps: PipelineDeps,
 	agents: AgentOutcome[],
-): Promise<{ verify: Hypothesis[]; overflow: Hypothesis[]; all: Hypothesis[]; failures: string[] }> {
+): Promise<{ verify: Hypothesis[]; overflow: Hypothesis[]; all: Hypothesis[]; failures: string[]; errors: string[] }> {
 	const assignments = huntAssignments(scope);
 	let done = 0;
 	deps.onProgress?.({ stage: "hunt", done, total: assignments.length });
@@ -157,11 +192,12 @@ export async function huntStage(
 
 	// Partition order, not completion order, so ids are deterministic for the same submissions.
 	const merged = mergeDuplicateHypotheses(perAssignment.flat());
-	const { verify, overflow } = applyHypothesisCap(merged, deps.settings.maxHypotheses);
+	const triage = await triageStage(profile, merged, deps, agents);
+	const { verify, overflow } = applyHypothesisCap(triage.candidates, deps.settings.maxHypotheses);
 	const withIds = [...verify, ...overflow].map(
 		(h, i): Hypothesis => ({ ...h, id: `H-${String(i + 1).padStart(3, "0")}`, fingerprint: fingerprint(h) }),
 	);
-	return { verify: withIds.slice(0, verify.length), overflow: withIds.slice(verify.length), all: withIds, failures };
+	return { verify: withIds.slice(0, verify.length), overflow: withIds.slice(verify.length), all: withIds, failures, errors: triage.error ? [triage.error] : [] };
 }
 
 export type VerifyResult =
@@ -190,6 +226,7 @@ export async function buildFinding(scope: Scope, hypothesis: Hypothesis, affirm:
 	if (cwe) finding.cwe = cwe;
 	if (affirm.cvss_vector) finding.cvss_vector = affirm.cvss_vector;
 	if (affirm.cvss_score !== undefined) finding.cvss_score = affirm.cvss_score;
+	if (hypothesis.consequences?.length) finding.consequences = hypothesis.consequences;
 	const introduced = await introducedIn(scope, hypothesis.anchors[0]!.file);
 	if (introduced) finding.introduced_in = introduced;
 	return finding;
@@ -283,9 +320,11 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 
 	const hunt = await huntStage(scope, profileResult.profile, deps, agents);
 	if (hunt.failures.length) incomplete.push(...hunt.failures.map((f) => `hunt agent failed (${f})`));
+	// Triage failure loses no coverage: it is an error, not a reason the run is incomplete.
+	errors.push(...hunt.errors);
 	if (hunt.overflow.length) incomplete.push(`${hunt.overflow.length} hypotheses over the cap of ${deps.settings.maxHypotheses} were not verified`);
 
-	const priors = new Map(hunt.verify.map((h) => [h.id, priorFalsePositive(previousStore, h.fingerprint)]));
+	const priors = priorFalsePositives(previousStore, hunt.verify);
 	const verified = await verifyStage(scope, profileResult.profile, hunt.verify, (h) => priors.get(h.id), deps, agents);
 	const newFindings: NewFinding[] = [];
 	const refuted: RefutedHypothesis[] = [];

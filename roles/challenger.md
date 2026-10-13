@@ -34,6 +34,8 @@ Record every defense you examine in `defenses_found` with its `path:line` (or "n
 - `downgraded`: the path is real but its value is limited by preconditions, mitigations, or threat model. The hypothesis becomes a risk finding.
 - `refuted`: an attribution failure or a blocking defense, or the affirmer's path does not hold in the code.
 
-Set `confidence` to how sure you are. Adjust `severity` if the affirmer over- or under-rated impact. If you were given a previous false-positive verdict for the same issue, confirm only if you have new evidence that the earlier reasoning was wrong, and say what changed.
+Give the verdict on the hypothesis itself, not on its consequences. If the hypothesis is refuted, its consequences fall with it. If it holds but a listed consequence does not, say so in your reasoning and set `severity` from the consequences that hold.
+
+Set `confidence` to how sure you are. Adjust `severity` if the affirmer over- or under-rated impact. If you were given a previous false-positive verdict, first check that it concerns the same code path as this hypothesis; if it does not, disregard it. If it does, confirm only if you have new evidence that the earlier reasoning was wrong, and say what changed.
 
 Use `hypothesis_id` exactly as given. Call `submit_argument` exactly once.

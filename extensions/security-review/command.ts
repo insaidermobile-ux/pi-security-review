@@ -7,7 +7,8 @@ import { type ScopeMode, SEVERITIES } from "./schema.ts";
 import { resolveScope, ScopeError } from "./scope.ts";
 import { resolveRoleModels, resolveSettings } from "./settings.ts";
 import { readSettingsLayers } from "./settings-source.ts";
-import { StoreError } from "./store.ts";
+import { STALE_SKIPPED_NOTE } from "./report.ts";
+import { StoreError, staleMarkingSkipped } from "./store.ts";
 
 export const COMMAND_NAME = "security-review";
 export const STATUS_KEY = "security-review";
@@ -30,6 +31,8 @@ export function statusText(progress: Progress | "scope"): string {
 			return `security-review: profile${progress.cached ? " (cached)" : ""}`;
 		case "hunt":
 			return `security-review: hunt ${progress.done}/${progress.total}`;
+		case "triage":
+			return "security-review: triage";
 		case "verify":
 			return `security-review: verify ${progress.done}/${progress.total}`;
 		case "report":
@@ -71,12 +74,15 @@ export function formatSummary(result: RunResult, cwd: string, usage: string): st
 		for (const finding of ordered.slice(0, MAX_LISTED_FINDINGS)) {
 			const anchor = finding.anchors[0]!;
 			const triaged = finding.status !== "open" ? ` (${finding.status})` : "";
-			lines.push(`- ${finding.id} [${finding.severity} ${finding.finding_class}] ${finding.title} - \`${anchor.file}:${anchor.line}\`${triaged}`);
+			const count = finding.consequences?.length ?? 0;
+			const consequences = count ? ` (+${plural(count, "consequence")})` : "";
+			lines.push(`- ${finding.id} [${finding.severity} ${finding.finding_class}] ${finding.title} - \`${anchor.file}:${anchor.line}\`${consequences}${triaged}`);
 		}
 		if (ordered.length > MAX_LISTED_FINDINGS) lines.push(`- ... and ${ordered.length - MAX_LISTED_FINDINGS} more in the report`);
 	}
 	if (result.summary) lines.push("", result.summary.trim());
 	if (!result.run.complete) lines.push("", `**Incomplete run:** ${result.run.incomplete_reasons.join("; ")}`);
+	if (staleMarkingSkipped(result.run)) lines.push(STALE_SKIPPED_NOTE);
 	lines.push("", `Report: \`${rel(result.reportPath)}\` · Findings: \`${rel(result.storePath)}\``, `Usage: ${usage}.`);
 	if (result.gitignoreHint) lines.push("", result.gitignoreHint);
 	return lines.join("\n");

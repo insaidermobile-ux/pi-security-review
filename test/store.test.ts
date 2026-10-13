@@ -11,7 +11,9 @@ import {
 	loadStore,
 	mergeRun,
 	type NewFinding,
-	priorFalsePositive,
+	matchKey,
+	matchStored,
+	priorFalsePositives,
 	projectFingerprint,
 	saveProfile,
 	saveStore,
@@ -138,8 +140,20 @@ describe("mergeRun", () => {
 		assert.equal(third.store.findings[0]!.status, "open");
 	});
 
+	test("an incomplete full-mode run marks nothing stale and reports the skip", () => {
+		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [newFinding(), newFinding({ function: "gone" })], now: "t1" }).store;
+		const incomplete = { ...run("full", "run-2"), complete: false, incomplete_reasons: ["hunt agent failed (timed out)"] };
+		const second = mergeRun(first, { run: incomplete, findings: [newFinding()], now: "t2" });
+		assert.equal(second.markedStale, 0);
+		assert.equal(second.staleSkipped, true);
+		assert.deepEqual(second.store.findings.map((f) => f.status), ["open", "open"]);
+		assert.equal(mergeRun(first, { run: run("full", "run-3"), findings: [], now: "t3" }).staleSkipped, false);
+	});
+
 	test("default mode leaves findings outside the run untouched", () => {
 		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [newFinding()], now: "t1" }).store;
+		const incomplete = mergeRun(first, { run: { ...run("diff", "run-1b"), complete: false }, findings: [], now: "t2" });
+		assert.equal(incomplete.staleSkipped, false);
 		const { store, markedStale } = mergeRun(first, { run: run("diff", "run-2"), findings: [], now: "t2" });
 		assert.equal(markedStale, 0);
 		assert.deepEqual(store.findings, first.findings);
@@ -167,13 +181,105 @@ describe("mergeRun", () => {
 		assert.equal(loadStore(root).findings[0]!.introduced_in, "abc123");
 	});
 
-	test("priorFalsePositive finds only false-positive findings by fingerprint", () => {
-		const { store } = mergeRun(emptyStore(), { run: run("diff"), findings: [newFinding()], now: "t1" });
-		const fp = store.findings[0]!.fingerprint;
-		assert.equal(priorFalsePositive(store, fp), undefined);
-		(store.findings[0] as Finding).status = "false-positive";
-		assert.equal(priorFalsePositive(store, fp)?.id, "SR-001");
+	test("priorFalsePositives returns only false-positive matches, including fallback matches", () => {
+		const { store } = mergeRun(emptyStore(), { run: run("diff"), findings: [newFinding(), authz({ line: 10, fn: "route registration" })], now: "t1" });
+		const exact = { ...hypothesisInput(), id: "H-001", fingerprint: store.findings[0]!.fingerprint };
+		const reworded = { ...hypothesisInput({ vuln_type: "missing-authz", anchors: [{ file: "src/server.js", line: 13 }] }), id: "H-002", fingerprint: "other" };
+		assert.equal(priorFalsePositives(store, [exact, reworded]).size, 0);
+		for (const finding of store.findings) (finding as Finding).status = "false-positive";
+		const priors = priorFalsePositives(store, [exact, reworded]);
+		assert.equal(priors.get("H-001")?.id, "SR-001");
+		assert.equal(priors.get("H-002")?.id, "SR-002");
 	});
+});
+
+function authz(options: { line: number; fn?: string; sink?: string; file?: string }): NewFinding {
+	const anchors = [{ file: options.file ?? "src/server.js", line: options.line, ...(options.fn ? { function: options.fn } : {}) }];
+	const h = hypothesisInput({ vuln_type: "missing-authz", anchors, suspected_sink: options.sink ?? "res.json(rows) returning user rows" });
+	return { ...newFinding(), fingerprint: fingerprint(h), vuln_type: "missing-authz", anchors };
+}
+
+function storedFindings(...findings: NewFinding[]): Finding[] {
+	return mergeRun(emptyStore(), { run: run("diff"), findings, now: "t1" }).store.findings;
+}
+
+describe("matchStored", () => {
+	test("matches by exact fingerprint", () => {
+		const stored = storedFindings(newFinding(), authz({ line: 10 }));
+		const matches = matchStored(stored, [matchKey(newFinding({ line: 99 }))]);
+		assert.equal(matches.get(0)?.id, "SR-001");
+	});
+
+	test("falls back to an unambiguous type and primary file when line, function, and sink differ", () => {
+		const stored = storedFindings(newFinding(), authz({ line: 10, fn: "app.get route registration" }));
+		const moved = authz({ line: 13, sink: "users.searchUsers query returning user PII" });
+		assert.notEqual(moved.fingerprint, stored[1]!.fingerprint);
+		assert.equal(matchStored(stored, [matchKey(moved)]).get(0)?.id, "SR-002");
+	});
+
+	test("normalizes type synonyms and paths in the fallback", () => {
+		const stored = storedFindings(authz({ line: 10, file: "src/server.js" }));
+		const key = { fingerprint: "x", vuln_type: "Missing Authorization", file: "./src/server.js" };
+		assert.equal(matchStored(stored, [key]).get(0)?.id, "SR-001");
+	});
+
+	test("does not fall back when two stored findings share the type and file", () => {
+		const stored = storedFindings(authz({ line: 10, fn: "listUsers" }), authz({ line: 30, fn: "deleteUser" }));
+		assert.equal(matchStored(stored, [matchKey(authz({ line: 50, fn: "exportUsers" }))]).size, 0);
+	});
+
+	test("does not fall back when two different observations share the type and file", () => {
+		const stored = storedFindings(authz({ line: 10, fn: "listUsers" }));
+		const matches = matchStored(stored, [matchKey(authz({ line: 30, fn: "deleteUser" })), matchKey(authz({ line: 50, fn: "exportUsers" }))]);
+		assert.equal(matches.size, 0);
+	});
+
+	test("a stored finding taken by an exact match is not a fallback candidate", () => {
+		const stored = storedFindings(authz({ line: 10, fn: "listUsers" }));
+		const exact = authz({ line: 12, fn: "listUsers" });
+		const other = authz({ line: 40, fn: "deleteUser" });
+		const matches = matchStored(stored, [matchKey(exact), matchKey(other)]);
+		assert.equal(matches.get(0)?.id, "SR-001");
+		assert.equal(matches.has(1), false);
+	});
+});
+
+describe("mergeRun fallback matching", () => {
+	test("a re-observation described differently keeps id, first_seen, and status, and takes the new fingerprint", () => {
+		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [authz({ line: 10, fn: "app.get route registration" })], now: "t1" }).store;
+		first.findings[0]!.status = "false-positive";
+		const moved = authz({ line: 13, fn: "searchUsers", sink: "db.query in searchUsers" });
+		const { store, added, updated } = mergeRun(first, { run: run("diff", "run-2"), findings: [moved], now: "t2" });
+		assert.deepEqual([added, updated, store.findings.length], [0, 1, 1]);
+		const finding = store.findings[0]!;
+		assert.deepEqual([finding.id, finding.status, finding.first_seen, finding.last_seen], ["SR-001", "false-positive", "t1", "t2"]);
+		assert.equal(finding.anchors[0]!.line, 13);
+		assert.equal(finding.fingerprint, moved.fingerprint);
+	});
+
+	test("a stale finding matched by the fallback is reopened", () => {
+		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [authz({ line: 10 })], now: "t1" }).store;
+		first.findings[0]!.status = "stale";
+		const { store } = mergeRun(first, { run: run("full", "run-2"), findings: [authz({ line: 11, fn: "searchUsers" })], now: "t2" });
+		assert.deepEqual(store.findings.map((f) => [f.id, f.status]), [["SR-001", "open"]]);
+	});
+
+	test("re-observation replaces consequences, and clears them when the new observation has none", () => {
+		const consequence = { vuln_type: "secret-disclosure", description: "d", anchors: [{ file: "src/users.ts", line: 12 }] };
+		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [newFinding({ consequences: [consequence] })], now: "t1" }).store;
+		const replaced = mergeRun(first, { run: run("diff", "run-2"), findings: [newFinding({ consequences: [{ ...consequence, vuln_type: "idor" }] })], now: "t2" }).store;
+		assert.deepEqual(replaced.findings[0]!.consequences!.map((c) => c.vuln_type), ["idor"]);
+		const cleared = mergeRun(replaced, { run: run("diff", "run-3"), findings: [newFinding()], now: "t3" }).store;
+		assert.equal("consequences" in cleared.findings[0]!, false);
+	});
+
+	test("an ambiguous observation becomes a new finding", () => {
+		const first = mergeRun(emptyStore(), { run: run("diff"), findings: [authz({ line: 10, fn: "listUsers" }), authz({ line: 30, fn: "deleteUser" })], now: "t1" }).store;
+		const { store, added } = mergeRun(first, { run: run("diff", "run-2"), findings: [authz({ line: 50, fn: "exportUsers" })], now: "t2" });
+		assert.equal(added, 1);
+		assert.deepEqual(store.findings.map((f) => f.id), ["SR-001", "SR-002", "SR-003"]);
+	});
+
 });
 
 describe("profile cache", () => {

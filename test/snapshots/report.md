@@ -31,6 +31,10 @@ One high-severity SQL injection needs fixing before merge.
 1. `src/server.ts:5`: GET /users reads req.query.name
 2. `src/users.ts:12`: name is concatenated into the SQL string passed to db.query
 
+**Consequences** (removed by the same fix)
+
+- sensitive-data-exposure at `src/users.ts:14`: Password hashes are returned through the same query.
+
 <details><summary>Verification</summary>
 
 **Affirmer**
@@ -102,6 +106,10 @@ One high-severity SQL injection needs fixing before merge.
 **Claim.** The name query parameter is concatenated into SQL
 
 **Why it was refuted** (confidence high): A defense blocks the path.
+
+**Consequences, refuted with it:**
+
+- secret-disclosure at `src/users.ts:14`: Password hashes are returned through the same query.
 
 - resolve and prefix check at `src/files.ts:9` (blocks)
 

@@ -1,6 +1,6 @@
 import { normalizeVulnType } from "./fingerprint.ts";
 import { type HuntAssignment, VULN_CLASSES } from "./prompts.ts";
-import type { Anchor, HypothesisInput } from "./schema.ts";
+import type { Anchor, Consequence, HypothesisInput } from "./schema.ts";
 import type { Scope } from "./scope.ts";
 
 /** Upper bound of hunt agents in full mode; concurrency is limited separately. */
@@ -65,6 +65,7 @@ export function subtreePartitions(files: readonly string[]): Group[] {
 
 export interface TaggedHypothesis extends HypothesisInput {
 	source_partition: string;
+	consequences?: Consequence[];
 }
 
 function anchorsOverlap(a: readonly Anchor[], b: readonly Anchor[]): boolean {
@@ -92,6 +93,52 @@ export function mergeDuplicateHypotheses(hypotheses: readonly TaggedHypothesis[]
 		Object.assign(match, keepIncoming ? { ...hypothesis } : {}, { anchors: unique, source_partition: [...partitions].join(", ") });
 	}
 	return merged;
+}
+
+/** Label of the candidate at `index` as shown to the triage agent. */
+export function candidateLabel(index: number): string {
+	return `C-${index + 1}`;
+}
+
+/** A triage group in candidate labels, already validated against the candidate list. */
+export interface CandidateGroup {
+	primary: string;
+	members: string[];
+}
+
+/**
+ * Fold each triage group into its primary candidate: the primary keeps its own fields (so its
+ * fingerprint is unchanged), takes the most severe estimate and the union of source partitions, and
+ * carries the other members as consequences. A group takes the position of its first member.
+ */
+export function applyTriageGroups(candidates: readonly TaggedHypothesis[], groups: readonly CandidateGroup[]): TaggedHypothesis[] {
+	const indexOf = (label: string) => Number.parseInt(label.slice(2), 10) - 1;
+	const groupAt = new Map<number, number[]>();
+	const grouped = new Set<number>();
+	for (const group of groups) {
+		const members = [...new Set(group.members.map(indexOf))].sort((a, b) => a - b);
+		const primary = indexOf(group.primary);
+		groupAt.set(members[0]!, [primary, ...members.filter((m) => m !== primary)]);
+		for (const member of members) grouped.add(member);
+	}
+	const result: TaggedHypothesis[] = [];
+	candidates.forEach((candidate, index) => {
+		const group = groupAt.get(index);
+		if (group) {
+			const [primary, ...others] = group.map((i) => candidates[i]!);
+			const members = [primary!, ...others];
+			const severity = members.map((m) => m.severity_estimate).sort((a, b) => SEVERITY_ORDER.indexOf(a) - SEVERITY_ORDER.indexOf(b))[0]!;
+			const partitions = new Set(members.flatMap((m) => m.source_partition.split(", ")));
+			const consequences: Consequence[] = [
+				...(primary!.consequences ?? []),
+				...others.flatMap((o) => [{ vuln_type: o.vuln_type, description: o.claim, anchors: o.anchors }, ...(o.consequences ?? [])]),
+			];
+			result.push({ ...primary!, severity_estimate: severity, source_partition: [...partitions].join(", "), consequences });
+		} else if (!grouped.has(index)) {
+			result.push(candidate);
+		}
+	});
+	return result;
 }
 
 /** Order by severity estimate (stable) and split at the cap. */

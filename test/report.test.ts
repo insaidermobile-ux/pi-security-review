@@ -72,14 +72,16 @@ const run: RunRecord = {
 	errors: [],
 };
 
+const CONSEQUENCE = { vuln_type: "sensitive-data-exposure", description: "Password hashes are returned through the same query.", anchors: [{ file: "src/users.ts", line: 14 }] };
+
 function render(): string {
 	return renderReport({
 		run,
 		scope: { mode: "diff", baseRef: "origin/main", mergeBase: "fedcba9876543210" },
-		findings: [risk, finding({})],
+		findings: [risk, finding({ consequences: [CONSEQUENCE] })],
 		refuted: [
 			{
-				hypothesis: refutedHypothesis,
+				hypothesis: { ...refutedHypothesis, consequences: [{ ...CONSEQUENCE, vuln_type: "secret-disclosure" }] },
 				affirmer: affirm("H-003"),
 				challenger: challenge("H-003", "refuted", { defenses_found: [{ defense: "resolve and prefix check", location: "src/files.ts:9", effect: "blocks" }] }),
 			},
@@ -102,7 +104,7 @@ describe("report", () => {
 		const medium = output.indexOf("### Medium");
 		assert.ok(high > 0 && medium > high);
 		assert.ok(output.indexOf("SR-001") < output.indexOf("SR-002"));
-		for (const text of ["**Affirmer**", "**Challenger**", "**Verdict:** confirmed", "**Verdict:** downgraded", "**Remediation.**", "## Refuted hypotheses", "H-003", "resolve and prefix check", "## Unverified hypotheses", "**Incomplete run:**", "## Summary"]) {
+		for (const text of ["**Affirmer**", "**Challenger**", "**Verdict:** confirmed", "**Verdict:** downgraded", "**Remediation.**", "## Refuted hypotheses", "H-003", "resolve and prefix check", "## Unverified hypotheses", "**Incomplete run:**", "## Summary", "**Consequences** (removed by the same fix)", "- sensitive-data-exposure at `src/users.ts:14`: Password hashes", "**Consequences, refuted with it:**"]) {
 			assert.ok(output.includes(text), text);
 		}
 	});
@@ -112,6 +114,13 @@ describe("report", () => {
 		assert.match(output, /No vulnerabilities or risks were confirmed/);
 		assert.match(output, /Scope: full project/);
 		assert.doesNotMatch(output, /Incomplete run/);
+		assert.doesNotMatch(output, /Stale marking skipped/);
+	});
+
+	test("notes skipped stale marking only for incomplete full-mode runs", () => {
+		const full = renderReport({ run: { ...run, mode: "full" }, scope: { mode: "full" }, findings: [], refuted: [], unverified: [] });
+		assert.match(full, /- \*\*Incomplete run:\*\* .*\n- Stale marking skipped: the run was incomplete\./);
+		assert.doesNotMatch(render(), /Stale marking skipped/);
 	});
 
 	test("counts by severity", () => {

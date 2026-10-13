@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AffirmArgument, Finding, Hypothesis, Profile } from "./schema.ts";
+import type { AffirmArgument, Finding, Hypothesis, HypothesisInput, Profile } from "./schema.ts";
 import type { Scope } from "./scope.ts";
 import type { Role } from "./settings.ts";
 
@@ -122,9 +122,30 @@ export function huntPrompt(profile: Profile | undefined, scope: Scope, assignmen
 	return parts.join("\n\n");
 }
 
+/** Candidates are shown with their triage labels; `labels[i]` belongs to `candidates[i]`. */
+export function triagePrompt(profile: Profile | undefined, candidates: readonly HypothesisInput[], labels: readonly string[]): string {
+	const shown = candidates.map((c, i) => ({
+		label: labels[i],
+		vuln_type: c.vuln_type,
+		severity_estimate: c.severity_estimate,
+		claim: c.claim,
+		anchors: c.anchors,
+		suspected_source: c.suspected_source,
+		suspected_sink: c.suspected_sink,
+	}));
+	return [
+		header("triage"),
+		profileSection(profile),
+		`## Candidates (${candidates.length})\n\n${json(shown)}`,
+		"Group the candidates that share a root cause and submit the groups with `submit_triage`.",
+	].join("\n\n");
+}
+
 function hypothesisSection(hypothesis: Hypothesis): string {
-	const { fingerprint: _fingerprint, source_partition: _partition, ...visible } = hypothesis;
-	return `## Hypothesis ${hypothesis.id}\n\n${json(visible)}`;
+	const { fingerprint: _fingerprint, source_partition: _partition, consequences, ...visible } = hypothesis;
+	const section = `## Hypothesis ${hypothesis.id}\n\n${json(visible)}`;
+	if (!consequences?.length) return section;
+	return `${section}\n\n## Consequences\n\nTriage judged that these issues follow from the hypothesis above and disappear with its fix. The verdict is about the hypothesis itself; the consequences describe what it enables.\n\n${json(consequences)}`;
 }
 
 export function affirmerPrompt(profile: Profile | undefined, hypothesis: Hypothesis, scope: Scope): string {
@@ -141,7 +162,7 @@ export function challengerPrompt(profile: Profile | undefined, hypothesis: Hypot
 	const parts = [header(`challenger:${hypothesis.id}`), profileSection(profile), hypothesisSection(hypothesis), `## Affirmer's argument\n\n${json(argument)}`];
 	if (prior) {
 		parts.push(
-			`## Previous verdict: false positive\n\nThe project's developers marked an earlier finding for the same issue (${prior.id}, "${prior.title}") as a false positive. The challenger reasoning recorded then was:\n\n${json(prior.verification.challenger)}\n\nConfirm this hypothesis again only if you have new evidence that the earlier reasoning is wrong, and state that evidence in your reasoning.`,
+			`## Previous verdict: false positive\n\nThe project's developers marked an earlier finding that appears to be the same issue (${prior.id}, "${prior.title}", anchored at ${prior.anchors.map((a) => `${a.file}:${a.line}`).join(", ")}) as a false positive. The challenger reasoning recorded then was:\n\n${json(prior.verification.challenger)}\n\nIf that finding concerns the same code path, confirm this hypothesis again only if you have new evidence that the earlier reasoning is wrong, and state that evidence in your reasoning. If it concerns a different code path, disregard it.`,
 		);
 	}
 	parts.push(`Challenge the argument and submit your verdict with \`submit_argument\` using \`hypothesis_id: "${hypothesis.id}"\`.`);
@@ -170,6 +191,7 @@ export function reportPrompt(stats: ReportStats, findings: Finding[]): string {
 		anchors: f.anchors,
 		status: f.status,
 		detail: f.description.detail,
+		...(f.consequences?.length ? { consequences: f.consequences.map((c) => c.vuln_type) } : {}),
 	}));
 	return [header("report"), `## Run statistics\n\n${json(stats)}`, `## Findings from this run\n\n${json(compact)}`, "Write the executive summary and submit it with `submit_summary`."].join(
 		"\n\n",

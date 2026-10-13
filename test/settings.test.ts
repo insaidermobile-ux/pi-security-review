@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { DEFAULT_SETTINGS, resolveRoleModels, resolveSettings } from "../extensions/security-review/settings.ts";
+import { DEFAULT_SETTINGS, ROLES, resolveRoleModels, resolveSettings } from "../extensions/security-review/settings.ts";
 import { tempDir } from "./temp.ts";
 
 describe("resolveSettings", () => {
@@ -57,7 +57,15 @@ describe("resolveRoleModels", () => {
 	test("uses the session model for every role without overrides", () => {
 		const { models, errors } = resolveRoleModels(DEFAULT_SETTINGS, session, find);
 		assert.deepEqual(errors, []);
-		for (const role of ["profile", "hunt", "affirmer", "challenger", "report"] as const) assert.equal(models![role], session);
+		for (const role of ["profile", "hunt", "triage", "affirmer", "challenger", "report"] as const) assert.equal(models![role], session);
+	});
+
+	test("accepts a triage override as a known role", () => {
+		const { settings, errors } = resolveSettings({ securityReview: { models: { triage: "openai/strong" } } });
+		assert.deepEqual(errors, []);
+		const { models } = resolveRoleModels(settings, session, find);
+		assert.equal(models!.triage.id, "strong");
+		assert.equal(models!.affirmer, session);
 	});
 
 	test("applies a per-role override only to that role", () => {
@@ -74,7 +82,7 @@ describe("resolveRoleModels", () => {
 
 	test("reports a missing session model for roles without override", () => {
 		const { errors } = resolveRoleModels({ ...DEFAULT_SETTINGS, models: { hunt: "openai/strong" } }, undefined, find);
-		assert.equal(errors.length, 4);
+		assert.equal(errors.length, ROLES.length - 1);
 	});
 });
 

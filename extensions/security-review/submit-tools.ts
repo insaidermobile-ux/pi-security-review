@@ -14,6 +14,8 @@ import {
 	type Profile,
 	ProfileInput,
 	SummaryInput,
+	type TriageInput,
+	TriageInput as TriageInputSchema,
 } from "./schema.ts";
 
 const Receipt = Type.Object({ recorded: Type.Boolean(), message: Type.String() });
@@ -113,6 +115,47 @@ export function createChallengeTool(hypothesisId: string, collector: ArgumentCol
 			checkHypothesisId(hypothesisId, params.hypothesis_id);
 			collector.argument = params;
 			return receipt("Verdict recorded. You are done.", true);
+		},
+	}) as unknown as ToolDefinition;
+}
+
+export type TriageGroup = TriageInput["groups"][number];
+
+export interface TriageCollector {
+	groups?: TriageGroup[];
+}
+
+/** Groups must use known labels, each label at most once, at least two members, and a primary inside the group. */
+export function checkTriageGroups(labels: readonly string[], groups: readonly TriageGroup[]): void {
+	const known = new Set(labels);
+	const seen = new Map<string, number>();
+	const problems: string[] = [];
+	groups.forEach((group, index) => {
+		const name = `Group ${index + 1}`;
+		const unknown = [...new Set([group.primary, ...group.members])].filter((label) => !known.has(label));
+		if (unknown.length) problems.push(`${name} names unknown candidates: ${unknown.join(", ")}. Known candidates are ${labels.join(", ")}.`);
+		const members = new Set(group.members);
+		if (members.size < 2) problems.push(`${name} has fewer than two distinct members; leave a candidate out of all groups to keep it separate.`);
+		if (!members.has(group.primary)) problems.push(`${name}: primary ${group.primary} must be one of its members.`);
+		for (const label of members) {
+			if (seen.has(label)) problems.push(`${label} appears in group ${seen.get(label)! + 1} and group ${index + 1}; each candidate may belong to one group.`);
+			else seen.set(label, index);
+		}
+	});
+	if (problems.length) throw new Error(`${problems.join("\n")}\nFix the grouping and call submit_triage again.`);
+}
+
+export function createTriageTool(labels: readonly string[], collector: TriageCollector): ToolDefinition {
+	return defineTool({
+		name: "submit_triage",
+		label: "Submit triage",
+		description: "Submit the groups of candidates that share a root cause. Submit an empty list when every candidate needs its own fix. Call exactly once.",
+		parameters: TriageInputSchema,
+		outputSchema: Receipt,
+		async execute(_id, params) {
+			checkTriageGroups(labels, params.groups);
+			collector.groups = params.groups;
+			return receipt(`Triage recorded (${params.groups.length} groups). You are done.`, true);
 		},
 	}) as unknown as ToolDefinition;
 }

@@ -3,7 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { type AgentOutcome, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
-import { applyHypothesisCap, huntAssignments, mergeDuplicateHypotheses, subtreePartitions } from "../extensions/security-review/partition.ts";
+import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, subtreePartitions } from "../extensions/security-review/partition.ts";
+import { fingerprint } from "../extensions/security-review/fingerprint.ts";
 import { huntStage, type PipelineDeps, profileStage, type Progress, runPipeline, verifyHypothesis } from "../extensions/security-review/pipeline.ts";
 import { VULN_CLASSES } from "../extensions/security-review/prompts.ts";
 import type { AffirmArgument, Hypothesis, HypothesisInput } from "../extensions/security-review/schema.ts";
@@ -60,6 +61,7 @@ function fixtureScripts(): Record<string, ScriptStep[]> {
 		"Agent: hunt:injection": [submit("submit_hypothesis", SQLI), say("one finding")],
 		"Agent: hunt:access-control": [submit("submit_hypothesis", { ...SQLI, anchors: [{ file: "src/users.js", line: 7, function: "searchUsers" }], severity_estimate: "medium" }), say("done")],
 		"Agent: hunt:files-deserialization": [submit("submit_hypothesis", TRAVERSAL), say("done")],
+		"Agent: triage": [submit("submit_triage", { groups: [] })],
 		"Agent: affirmer:H-001": [submit("submit_argument", affirm("H-001", { attack_path: [{ location: "src/users.js:6", description: "name concatenated into SQL" }] }))],
 		"Agent: challenger:H-001": [submit("submit_argument", challenge("H-001", "confirmed"))],
 		"Agent: affirmer:H-002": [submit("submit_argument", affirm("H-002", { component: "File download (src/files.js)", consequence: "reading arbitrary files" }))],
@@ -172,8 +174,138 @@ describe("hunt partitioning", () => {
 		]);
 		assert.deepEqual(hunt.verify.map((h) => h.id), ["H-001"]);
 		assert.deepEqual(hunt.overflow.map((h) => h.id), ["H-002"]);
-		assert.equal(agents.length, 6);
-		assert.deepEqual(env.progress.at(-1), { stage: "hunt", done: 6, total: 6 });
+		assert.equal(agents.length, 7);
+		assert.equal(agents.at(-1)!.label, "triage");
+		assert.deepEqual(env.progress.at(-1), { stage: "triage" });
+	});
+});
+
+const DISCLOSURE: HypothesisInput = hypothesisInput({
+	anchors: [{ file: "src/users.js", line: 6, function: "searchUsers" }],
+	claim: "Session digests can be read through the injection",
+	vuln_type: "secret-disclosure",
+	suspected_sink: "res.json returning session_digest",
+	severity_estimate: "critical",
+});
+const RATE_LIMIT: HypothesisInput = hypothesisInput({
+	anchors: [{ file: "src/users.js", line: 4, function: "searchUsers" }],
+	claim: "No rate limit on user search",
+	vuln_type: "missing-rate-limit",
+	suspected_sink: "db.query per request",
+	severity_estimate: "low",
+});
+
+describe("triage groups", () => {
+	const candidates = [
+		{ ...RATE_LIMIT, source_partition: "logic-concurrency" },
+		{ ...SQLI, source_partition: "injection" },
+		{ ...TRAVERSAL, source_partition: "files-deserialization" },
+		{ ...DISCLOSURE, source_partition: "secrets-crypto" },
+	];
+
+	test("labels candidates C-1..C-n", () => {
+		assert.deepEqual(candidates.map((_, i) => candidateLabel(i)), ["C-1", "C-2", "C-3", "C-4"]);
+	});
+
+	test("folds members into the primary as consequences at the first member's position", () => {
+		const result = applyTriageGroups(candidates, [{ primary: "C-2", members: ["C-4", "C-2"] }]);
+		assert.deepEqual(result.map((h) => h.vuln_type), ["missing-rate-limit", "sql-injection", "path-traversal"]);
+		const merged = result[1]!;
+		assert.equal(merged.claim, SQLI.claim);
+		assert.equal(merged.severity_estimate, "critical");
+		assert.equal(merged.source_partition, "injection, secrets-crypto");
+		assert.deepEqual(merged.consequences, [{ vuln_type: "secret-disclosure", description: DISCLOSURE.claim, anchors: DISCLOSURE.anchors }]);
+		assert.equal(fingerprint(merged), fingerprint(SQLI));
+	});
+
+	test("a group placed later than its primary keeps a deterministic order", () => {
+		const result = applyTriageGroups(candidates, [{ primary: "C-4", members: ["C-3", "C-4"] }]);
+		assert.deepEqual(result.map((h) => h.vuln_type), ["missing-rate-limit", "sql-injection", "secret-disclosure"]);
+		assert.equal(result[2]!.consequences![0]!.vuln_type, "path-traversal");
+	});
+
+	test("no groups leaves the candidates unchanged", () => {
+		assert.deepEqual(applyTriageGroups(candidates, []), candidates);
+	});
+});
+
+/** SQL injection, the disclosure it enables, and an unrelated rate-limit issue; triage groups the first two. */
+function groupingScripts(triage: ScriptStep[] = [submit("submit_triage", { groups: [{ primary: "C-1", members: ["C-1", "C-2"], reason: "same query" }] })]) {
+	const scripts: Record<string, ScriptStep[]> = {
+		"Agent: profile": [submit("submit_profile", PROFILE)],
+		"Agent: hunt:injection": [submit("submit_hypothesis", SQLI), say("done")],
+		"Agent: hunt:secrets-crypto": [submit("submit_hypothesis", DISCLOSURE), say("done")],
+		"Agent: hunt:logic-concurrency": [submit("submit_hypothesis", RATE_LIMIT), say("done")],
+		"Agent: triage": triage,
+		"Agent: report": [submit("submit_summary", { summary: "Summary." })],
+	};
+	for (const id of ["H-001", "H-002", "H-003"]) {
+		scripts[`Agent: affirmer:${id}`] = [submit("submit_argument", affirm(id))];
+		scripts[`Agent: challenger:${id}`] = [submit("submit_argument", challenge(id, "confirmed"))];
+	}
+	return scripts;
+}
+
+describe("triage stage", () => {
+	test("grouping folds a consequence into its root cause and saves verification agents", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup(groupingScripts());
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.deepEqual(result.hypotheses.map((h) => [h.id, h.vuln_type, h.severity_estimate]), [
+			["H-001", "sql-injection", "critical"],
+			["H-002", "missing-rate-limit", "low"],
+		]);
+		assert.deepEqual(result.hypotheses[0]!.consequences!.map((c) => c.vuln_type), ["secret-disclosure"]);
+		const labels = result.agents.map((a) => a.label);
+		assert.ok(labels.includes("triage"));
+		assert.ok(!labels.some((l) => l.endsWith(":H-003")), labels.join(", "));
+		assert.equal(result.findings.length, 2);
+		const stored = loadStore(root).findings.find((f) => f.vuln_type === "sql-injection")!;
+		assert.deepEqual(stored.consequences, [{ vuln_type: "secret-disclosure", description: DISCLOSURE.claim, anchors: DISCLOSURE.anchors }]);
+		assert.match(readFileSync(result.reportPath, "utf8"), /\*\*Consequences\*\* \(removed by the same fix\)\n\n- secret-disclosure at `src\/users\.js:6`/);
+		assert.match(env.prompts.get("Agent: affirmer:H-001")!, /## Consequences[\s\S]*secret-disclosure/);
+		assert.match(env.prompts.get("Agent: triage")!, /"label": "C-3"[\s\S]*missing-rate-limit/);
+	});
+
+	test("a refuted root cause is recorded with its consequences and creates no finding for them", async () => {
+		const root = makeFixtureRepo();
+		const scripts = groupingScripts();
+		scripts["Agent: challenger:H-001"] = [submit("submit_argument", challenge("H-001", "refuted"))];
+		const env = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.deepEqual(result.findings.map((f) => f.vuln_type), ["missing-rate-limit"]);
+		assert.equal(result.refuted[0]!.hypothesis.consequences![0]!.vuln_type, "secret-disclosure");
+		assert.equal(loadStore(root).runs[0]!.refuted[0]!.hypothesis.consequences!.length, 1);
+	});
+
+	test("a group counts once against the hypothesis cap", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup(groupingScripts(), { settings: { maxHypotheses: 2 } });
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(result.unverified.length, 0);
+		assert.equal(result.run.complete, true, result.run.incomplete_reasons.join("; "));
+	});
+
+	test("a single candidate runs no triage agent", async () => {
+		const root = makeFixtureRepo();
+		const scripts = groupingScripts();
+		delete scripts["Agent: hunt:secrets-crypto"];
+		delete scripts["Agent: hunt:logic-concurrency"];
+		const env = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(result.hypotheses.length, 1);
+		assert.ok(!result.agents.some((a) => a.label === "triage"));
+		assert.ok(!env.progress.some((p) => p.stage === "triage"));
+	});
+
+	test("a hung triage agent leaves hypotheses ungrouped and the run complete, with an error", async () => {
+		const root = makeFixtureRepo();
+		const env = await setup(groupingScripts([hang]), { timeoutMs: 3000 });
+		const result = await runPipeline(await resolveScope(root, "diff"), env.makeDeps(root));
+		assert.equal(result.hypotheses.length, 3);
+		assert.equal(result.run.complete, true, result.run.incomplete_reasons.join("; "));
+		assert.ok(result.run.errors.some((e) => e.startsWith("triage unavailable") && e.includes("timed out")), result.run.errors.join("; "));
+		assert.match(readFileSync(result.reportPath, "utf8"), /## Errors[\s\S]*triage unavailable/);
 	});
 });
 
@@ -232,12 +364,15 @@ describe("verify stage", () => {
 		const prior = {
 			id: "SR-007",
 			title: "Old title",
+			anchors: [{ file: "src/users.js", line: 5 }],
 			verification: { challenger: challenge("H-009", "confirmed", { reasoning: "UNIQUE-PRIOR-REASONING" }) },
 		} as never;
 		await verifyHypothesis(await resolveScope(root, "diff"), PROFILE, hypothesis, prior, env.makeDeps(root), []);
 		const prompt = env.prompts.get("Agent: challenger:H-001")!;
 		assert.match(prompt, /Previous verdict: false positive/);
 		assert.match(prompt, /SR-007/);
+		assert.match(prompt, /src\/users\.js:5/);
+		assert.match(prompt, /If it concerns a different code path, disregard it\./);
 		assert.match(prompt, /UNIQUE-PRIOR-REASONING/);
 	});
 });
@@ -273,7 +408,7 @@ describe("end-to-end with scripted model responses", () => {
 		const total = env.ledger.total().totalTokens;
 		assert.ok(total > 0);
 		assert.equal(total, result.agents.reduce((sum, a) => sum + a.usage.totalTokens, 0));
-		assert.deepEqual(env.progress.map((p) => p.stage).filter((s, i, all) => s !== all[i - 1]), ["profile", "hunt", "verify", "report"]);
+		assert.deepEqual(env.progress.map((p) => p.stage).filter((s, i, all) => s !== all[i - 1]), ["profile", "hunt", "triage", "verify", "report"]);
 	});
 
 	test("a re-run keeps a false-positive status and passes the prior verdict to the challenger", async () => {
@@ -290,6 +425,25 @@ describe("end-to-end with scripted model responses", () => {
 		assert.equal(result.findings[0]!.id, "SR-001");
 		assert.match(second.prompts.get("Agent: challenger:H-001")!, /Previous verdict: false positive/);
 		assert.equal(result.gitignoreHint, undefined, "hint shown once per project");
+	});
+
+	test("a re-run that describes a dismissed issue differently still passes the prior verdict", async () => {
+		const root = makeFixtureRepo();
+		const first = await setup(fixtureScripts());
+		await runPipeline(await resolveScope(root, "diff"), first.makeDeps(root));
+		const store = loadStore(root);
+		store.findings[0]!.status = "false-positive";
+		saveStore(root, store);
+
+		const scripts = fixtureScripts();
+		const reworded = { ...SQLI, anchors: [{ file: "src/users.js", line: 7 }], suspected_sink: "pool.query receiving the LIKE pattern" };
+		scripts["Agent: hunt:injection"] = [submit("submit_hypothesis", reworded), say("one finding")];
+		scripts["Agent: hunt:access-control"] = [say("nothing")];
+		const second = await setup(scripts);
+		const result = await runPipeline(await resolveScope(root, "diff"), second.makeDeps(root));
+		assert.notEqual(result.hypotheses[0]!.fingerprint, store.findings[0]!.fingerprint);
+		assert.match(second.prompts.get("Agent: challenger:H-001")!, /Previous verdict: false positive[\s\S]*SR-001/);
+		assert.deepEqual(loadStore(root).findings.map((f) => [f.id, f.status]), [["SR-001", "false-positive"]]);
 	});
 
 	test("a failing hunt agent marks the run incomplete while other results proceed", async () => {

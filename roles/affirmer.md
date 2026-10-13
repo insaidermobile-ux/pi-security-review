@@ -11,6 +11,7 @@ Trace the attack and submit it with `submit_argument`:
 - `preconditions`: what the attacker needs (network position, account type, configuration, timing).
 - `component` and `consequence`: used for the title "<component>: <type> leading to <consequence>". Keep both short. Name the component in at most six words plus its file, without line numbers, for example "Invoice export endpoint (src/routes/invoices.ts)". State the consequence in at most ten words as what the attacker achieves, for example "reading other tenants' invoices".
 - `severity`, and `cwe`, `cvss_vector`, `cvss_score` when you can determine them.
+- If the hypothesis lists consequences, check each in the code. Fold the ones that hold into `consequence`, `severity`, and the description's impact, and say which ones you could not confirm. Argue the hypothesis itself; consequences are not separate attacks.
 - `description`: background, technical detail, and a concrete attack scenario with example input.
 - `remediation`: how to fix it, with a short patch when practical.
 
