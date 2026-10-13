@@ -11,13 +11,11 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { BRIDGE_PROVIDER, recordBridgePrompt } from "./bridge.ts";
+import { createReadOnlyTools } from "./read-tools.ts";
 import type { Role } from "./settings.ts";
 import { createShellTool } from "./shell.ts";
 
 type ThinkingLevel = NonNullable<Parameters<typeof createAgentSession>[0]>["thinkingLevel"];
-
-/** Built-in tools that only read. `write`, `edit`, and `bash` are never given to audit agents. */
-export const READ_ONLY_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
 
 export function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -143,11 +141,12 @@ function isolatedResources(systemPrompt: string): ResourceLoader {
 
 /**
  * Create an isolated, read-only, in-memory session for one audit agent: no extensions, skills,
- * context files, or user settings; only read-only built-ins, the restricted shell, and the role's
- * submission tools.
+ * context files, or user settings; only read-only tools confined to the project, the restricted
+ * shell, and the role's submission tools.
  */
 export async function createAuditSession(options: SdkRunnerOptions, spec: Pick<AgentSpec, "model" | "systemPrompt" | "tools">): Promise<AgentSession> {
-	const customTools = [createShellTool(options.root) as unknown as ToolDefinition, ...spec.tools];
+	// The confined read tools replace pi's built-ins of the same names.
+	const customTools = [...createReadOnlyTools(options.root), createShellTool(options.root) as unknown as ToolDefinition, ...spec.tools];
 	const { session } = await createAgentSession({
 		cwd: options.root,
 		agentDir: getAgentDir(),
@@ -155,7 +154,7 @@ export async function createAuditSession(options: SdkRunnerOptions, spec: Pick<A
 		thinkingLevel: options.thinkingLevel,
 		modelRuntime: options.modelRuntime,
 		resourceLoader: isolatedResources(spec.systemPrompt),
-		tools: [...READ_ONLY_BUILTIN_TOOLS, ...customTools.map((tool) => tool.name)],
+		tools: customTools.map((tool) => tool.name),
 		customTools,
 		sessionManager: SessionManager.inMemory(options.root),
 		settingsManager: SettingsManager.inMemory({ retry: { enabled: true, ...(options.retry ?? AGENT_RETRY) } }),
