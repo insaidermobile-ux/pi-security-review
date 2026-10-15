@@ -1,6 +1,10 @@
 # pi-security-review
 
+**One agent finds it. Another challenges it.**
+
 Adversarial, multi-agent security review for [pi](https://pi.dev).
+
+![One agent finds it. Another challenges it. Adversarial security review for pi.](https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/security-review-cover.png)
 
 [![npm version](https://img.shields.io/npm/v/@insaidermobile-ux/pi-security-review)](https://www.npmjs.com/package/@insaidermobile-ux/pi-security-review)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -8,7 +12,7 @@ Adversarial, multi-agent security review for [pi](https://pi.dev).
 
 Run `/security-review` in a pi session to audit your unmerged changes or whole project for exploitable vulnerabilities, with independent verification before reporting.
 
-![Security review summary posted into a pi session after a run](docs/report-summary.png)
+![Security review summary posted into a pi session after a run](https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/report-summary.png)
 
 Inspired by Claude Code's `/security-review` and by the affirmer/challenger verification in [VulnHunter](https://github.com/Clouditera/VulnHunter).
 
@@ -51,6 +55,8 @@ pi -e ./pi-security-review
 ```
 
 ## How it works
+
+![Security review workflow: scope, profile, hunt, triage, adversarial verification, and report.](https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/security-review-workflow.png)
 
 ```
 /security-review [full]

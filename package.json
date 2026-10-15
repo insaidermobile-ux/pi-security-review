@@ -1,7 +1,7 @@
 {
   "name": "@insaidermobile-ux/pi-security-review",
-  "version": "0.1.0",
-  "description": "Adversarial multi-agent security review for pi: /security-review audits your branch or whole project with affirmer/challenger verification.",
+  "version": "0.1.1",
+  "description": "One agent finds it. Another challenges it. Adversarial multi-agent security review for pi, with read-only inspection and persistent findings.",
   "license": "MIT",
   "author": "insaidermobile-ux",
   "repository": {
@@ -23,6 +23,7 @@
   "files": [
     "extensions",
     "roles",
+    "docs",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
@@ -31,7 +32,7 @@
     "extensions": [
       "./extensions/security-review/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/report-summary.png"
+    "image": "https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/security-review-cover.png"
   },
   "scripts": {
     "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
