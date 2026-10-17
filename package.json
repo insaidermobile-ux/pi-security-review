@@ -1,7 +1,7 @@
 {
   "name": "@insaidermobile-ux/pi-security-review",
-  "version": "0.1.1",
-  "description": "One agent finds it. Another challenges it. Adversarial multi-agent security review for pi, with read-only inspection and persistent findings.",
+  "version": "0.1.2",
+  "description": "Security review for pi. Read-only agents find vulnerabilities, separate agents challenge each attack path, and a findings store keeps results across runs.",
   "license": "MIT",
   "author": "insaidermobile-ux",
   "repository": {

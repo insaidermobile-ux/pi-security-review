@@ -1,28 +1,26 @@
 # pi-security-review
 
-**One agent finds it. Another challenges it.**
+Security review for [pi](https://pi.dev). Agents look for vulnerabilities in your code, then separate agents build and challenge each proposed attack path.
 
-Adversarial, multi-agent security review for [pi](https://pi.dev).
-
-![One agent finds it. Another challenges it. Adversarial security review for pi.](https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/security-review-cover.png)
+![Security review for pi.](https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/security-review-cover.png)
 
 [![npm version](https://img.shields.io/npm/v/@insaidermobile-ux/pi-security-review)](https://www.npmjs.com/package/@insaidermobile-ux/pi-security-review)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js >=22.18](https://img.shields.io/badge/node-%3E%3D22.18-green.svg)](https://nodejs.org/)
 
-Run `/security-review` in a pi session to audit your unmerged changes or whole project for exploitable vulnerabilities, with independent verification before reporting.
+Run `/security-review` to review unmerged changes, or `/security-review full` to review the whole project. Agents inspect code without running or changing it. Findings include the attack argument and the challenger's response.
 
 ![Security review summary posted into a pi session after a run](https://raw.githubusercontent.com/insaidermobile-ux/pi-security-review/main/docs/report-summary.png)
 
 Inspired by Claude Code's `/security-review` and by the affirmer/challenger verification in [VulnHunter](https://github.com/Clouditera/VulnHunter).
 
-## Why pi-security-review?
+## What it does
 
-- **Adversarial verification:** an affirmer builds the attack path, then an independent challenger tries to refute it.
-- **Read-only, confined agents:** inspection tools stay inside the project; agents cannot modify the audited code.
-- **Persistent findings:** a deduplicated store preserves your decisions across runs.
-- **Per-role models:** choose different models for hunting, verification, and reporting.
-- **Diff or full mode:** review unmerged changes or the whole project.
+- An affirmer builds each proposed attack path. An independent challenger tries to refute it.
+- Audit agents use read-only tools restricted to the project directory.
+- The findings store deduplicates results and keeps your decisions across runs.
+- You can choose a model for each role.
+- You can review unmerged changes or the whole project.
 
 ## Quick start
 
@@ -70,11 +68,11 @@ pi -e ./pi-security-review
 ```
 
 1. **scope**: resolves which files to audit using git.
-2. **profile**: one agent describes the project: stack, entry points, trust boundaries, auth model, external inputs. Cached between runs.
+2. **profile**: one agent records the project's stack, entry points, trust boundaries, authentication model, and external inputs. The extension caches this profile between runs.
 3. **hunt**: several agents in parallel look for candidate vulnerabilities and submit *hypotheses* with code anchors, a suspected source, and a suspected sink.
-4. **triage**: when there are at least two hypotheses, one agent groups the ones a single code fix would remove, for example a SQL injection and the secret disclosure it enables. Each group is verified as one hypothesis: the root cause, with the others attached as consequences. If triage fails, hypotheses are verified separately.
+4. **triage**: when there are at least two hypotheses, one agent groups those that a single code fix would remove. For example, it may group a SQL injection with the secret disclosure it enables. Verification checks the root cause and records the others as consequences. If triage fails, verification checks each hypothesis separately.
 5. **verify**: for every hypothesis an **affirmer** agent builds the attack path, then an independent **challenger** agent tries to refute it. It checks attribution (is the "attacker" already trusted?), code defenses between source and sink, and whether the attack has independent security value. Confirmed hypotheses become `vulnerability` findings, downgraded ones become `risk` findings, and refuted ones are kept in a log with the reasoning.
-6. **report**: writes `report.md` and merges findings into `findings.json`, then one agent writes a short summary for the report, and the command posts the result into the session.
+6. **report**: the extension writes `report.md` and merges findings into `findings.json`. One agent writes a short report summary. The command posts the result into the session.
 
 Agents submit results through schema-validated tools, so every finding has anchors, a severity, a confidence, and both verification arguments.
 
@@ -89,9 +87,9 @@ Run the command inside a git repository.
 
 Both modes remove files matched by your configured `exclude` patterns.
 
-Progress is shown in pi's status bar, for example `security-review: hunt 3/6`, `security-review: triage`, and then `security-review: verify 7/12`. When the run finishes, a summary with counts by severity is posted into the session.
+Pi's status bar shows progress, for example `security-review: hunt 3/6` or `security-review: verify 7/12`. When the run finishes, the command posts a summary with counts by severity into the session.
 
-To stop a running review, press Esc. Agents stop, what was already verified is kept in the report and the store, and the run is marked incomplete. Where pi runs commands without queueing them, such as RPC mode, send `/security-review cancel`; in the terminal a command typed during a review waits until the review ends.
+Press Esc to stop a review. The extension keeps verified results in the report and findings store and marks the run incomplete. In RPC mode, send `/security-review cancel`. In the terminal, commands typed during a review wait until it ends.
 
 ### Output
 
