@@ -5,21 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-20
 
 ### Added
 
-- Shared severity definitions for hunters, affirmers, and challenger agents: a path that fully defeats an explicit control ranks above one that only weakens it, and severity never exceeds the impact shown in code.
-- Two hunt classes, feature abuse and data exposure, and a wildcard class, so default mode runs eight hunt agents. Access control, injection, and business logic hunters get more specific questions.
-- Profile domains: the profile agent picks up to four of nine security domains. Hunters receive each domain's attack classes and verification agents its rules for what counts as a finding. Domain guidance and severity definitions are adapted from Cloudflare's security-audit-skill (MIT, see `THIRD_PARTY_NOTICES.md`).
+- Hunters, affirmers, and challengers rate severity with one shared scale. A path that fully defeats an explicit control ranks above one that only weakens it. Severity never exceeds the impact the agent can show in code.
+- Two hunt classes. "Feature abuse and data exposure" covers legitimate features used against other users. "Wildcard" covers anything the other classes would miss. Default mode now runs eight hunt agents instead of six.
+- The access control, injection, and business logic classes ask more specific questions, such as whether a cheaper code path skips the check and whether a request body can override the caller's identity.
+- The profile agent picks up to four of nine security domains, such as AI agents, supply chain and CI, or client-side code. Every hunt prompt gets the attack classes of those domains. Affirmer and challenger prompts get each domain's rules for what counts as a finding. With two domains, a hunt prompt grows by about 2k tokens.
+- `THIRD_PARTY_NOTICES.md`. The severity scale, the domain guidance, and part of the class descriptions come from Cloudflare's security-audit-skill (MIT), condensed for a review that does not run code.
 
 ### Changed
 
-- A cached `profile.json` without `domains` is regenerated once.
+- The extension regenerates a cached `profile.json` that has no `domains` field, once per project.
 
 ### Security
 
-- The audit agents' `shell` tool now path-checks values attached to git short options, such as `git diff -O/abs/file`, `git blame -S/abs/file`, and `git ls-files -X/abs/file`. Before, these values skipped the check, and git's error messages let an agent learn whether a file outside the project exists.
+- The audit agents' `shell` tool now checks paths attached to git short options, such as `git diff -O/abs/file`, `git blame -S/abs/file`, and `git ls-files -X/abs/file`. Before, these paths skipped the check. An agent could read git's error message and learn whether a file outside the project exists.
 
 ## [0.1.2] - 2026-10-17
 
@@ -54,3 +56,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.0]: https://github.com/insaidermobile-ux/pi-security-review/releases/tag/v0.1.0
 
 [0.1.1]: https://github.com/insaidermobile-ux/pi-security-review/compare/v0.1.0...v0.1.1
+
+[0.2.0]: https://github.com/insaidermobile-ux/pi-security-review/releases/tag/v0.2.0
