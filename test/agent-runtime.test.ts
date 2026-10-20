@@ -87,6 +87,12 @@ describe("read-only shell", () => {
 		assert.ok(checkCommand("git diff --output-indicator-new=x HEAD~1", root).includes("diff"));
 		assert.deepEqual(checkCommand("rg -tzig main", root), ["rg", "-tzig", "main"]);
 		assert.deepEqual(checkCommand("rg foo -- -z", root), ["rg", "foo", "--", "-z"]);
+		// Attached values inside the project, and flags combined with value-taking options, stay allowed.
+		assert.ok(checkCommand("git diff -O.gitorder HEAD~1", root).includes("-O.gitorder"));
+		assert.ok(checkCommand("git log -n5 -pM", root).includes("-pM"));
+		assert.ok(checkCommand("git log -L1,5:src/a.ts", root).includes("-L1,5:src/a.ts"));
+		assert.ok(checkCommand("git blame -C -S.revs src/a.ts", root).includes("-S.revs"));
+		assert.ok(checkCommand("git ls-files -oiX.gitignore", root).includes("-oiX.gitignore"));
 	});
 
 	const rejected: Array<[string, RegExp]> = [
@@ -128,6 +134,14 @@ describe("read-only shell", () => {
 		["git grep --recurse-submodules x", /not allowed/],
 		["rg -L foo", /not allowed/],
 		["rg -f/etc/passwd foo", /outside the project/],
+		// git short options with an attached file value: an order file, a revisions file, an exclude file.
+		["git diff -O/etc/hosts", /outside the project/],
+		["git diff -pO/etc/hosts", /outside the project/],
+		["git log -p -O../order", /outside the project/],
+		["git show -O~/order", /outside the project/],
+		["git blame -S/etc/hosts src/a.ts", /outside the project/],
+		["git ls-files -o -i -X/etc/hosts", /outside the project/],
+		["git ls-files -oiX/etc/hosts", /outside the project/],
 		["rg -f=/etc/passwd foo", /outside the project/],
 		["cat -- /etc/passwd", /outside the project/],
 		// Names inherited from Object.prototype are not commands.

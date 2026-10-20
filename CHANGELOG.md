@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- The audit agents' `shell` tool now path-checks values attached to git short options, such as `git diff -O/abs/file`, `git blame -S/abs/file`, and `git ls-files -X/abs/file`. Before, these values skipped the check, and git's error messages let an agent learn whether a file outside the project exists.
+
 ## [0.1.2] - 2026-10-17
 
 ### Changed

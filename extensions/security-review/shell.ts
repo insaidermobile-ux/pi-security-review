@@ -38,8 +38,22 @@ const GIT_RULES: OptionRules = {
 	short: "",
 	shortWithValue: "",
 };
-/** `git grep -O<pager>` runs the pager; elsewhere `-O` only names an order file. */
-const GIT_GREP_RULES: OptionRules = { ...GIT_RULES, short: "O", shortWithValue: "efABCm" };
+/**
+ * Short options of the diff family that take a value. Listing them makes an attached value such as
+ * `-O/etc/hosts` (an order file git reads) go through the path check like a separate argument would.
+ */
+const GIT_DIFF_SHORT_VALUES = "OSGIlUBMCX";
+/** Per-subcommand rules. `git grep -O<pager>` runs the pager; elsewhere `-O` only names an order file. */
+const GIT_SUBCOMMAND_RULES = new Map<string, OptionRules>([
+	["grep", { ...GIT_RULES, short: "O", shortWithValue: "efABCm" }],
+	["diff", { ...GIT_RULES, shortWithValue: GIT_DIFF_SHORT_VALUES }],
+	["log", { ...GIT_RULES, shortWithValue: `${GIT_DIFF_SHORT_VALUES}nL` }],
+	["show", { ...GIT_RULES, shortWithValue: `${GIT_DIFF_SHORT_VALUES}nL` }],
+	// `-S<file>` reads revisions from a file.
+	["blame", { ...GIT_RULES, shortWithValue: "SCML" }],
+	// `-X<file>` reads exclude patterns from a file.
+	["ls-files", { ...GIT_RULES, shortWithValue: "xX" }],
+]);
 
 const OPTION_RULES = new Map<string, OptionRules>([
 	["git", GIT_RULES],
@@ -143,7 +157,7 @@ export function checkCommand(command: string, root: string): string[] {
 		if (!sub || !GIT_SUBCOMMANDS.has(sub)) {
 			throw new ShellRejection(`"git ${sub ?? ""}" is not allowed. The subcommand must come first and be one of: ${[...GIT_SUBCOMMANDS].join(", ")}.`);
 		}
-		if (sub === "grep") rules = GIT_GREP_RULES;
+		rules = GIT_SUBCOMMAND_RULES.get(sub) ?? GIT_RULES;
 	}
 	let options = true;
 	for (const arg of args) {
