@@ -7,7 +7,7 @@ import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments,
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
 import { failureReasons, huntStage, type PipelineDeps, profileStage, type Progress, runPipeline, verifyHypothesis } from "../extensions/security-review/pipeline.ts";
 import { VULN_CLASSES } from "../extensions/security-review/prompts.ts";
-import type { AffirmArgument, Hypothesis, HypothesisInput } from "../extensions/security-review/schema.ts";
+import type { AffirmArgument, Hypothesis, HypothesisInput, Profile } from "../extensions/security-review/schema.ts";
 import { resolveScope } from "../extensions/security-review/scope.ts";
 import { DEFAULT_SETTINGS, ROLES } from "../extensions/security-review/settings.ts";
 import { loadStore, saveStore, StoreError, storePath } from "../extensions/security-review/store.ts";
@@ -15,13 +15,14 @@ import { failTimes, fauxAssistantMessage, fauxToolCall, hang, inTurn, providerEr
 import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
 import { commitAll, makeFixtureRepo, makeRepo, sh } from "./git-fixtures.ts";
 
-const PROFILE = {
+const PROFILE: Profile = {
 	summary: "Express API with user search and file download.",
 	stack: ["javascript", "express", "pg"],
 	entry_points: [{ location: "src/server.js:10", description: "GET /files" }],
 	trust_boundaries: ["anonymous vs authenticated user"],
 	auth_model: "Bearer session tokens via requireUser",
 	external_inputs: ["query parameters"],
+	domains: ["web-auth"],
 };
 
 const SQLI: HypothesisInput = hypothesisInput({
@@ -111,6 +112,24 @@ describe("profile stage", () => {
 		assert.deepEqual(env.progress.at(-1), { stage: "profile", cached: true });
 	});
 
+	test("an unknown domain is rejected with the allowed list and the agent may resubmit", async () => {
+		const root = makeFixtureRepo();
+		let toolError = "";
+		const env = await setup({
+			"Agent: profile": [
+				submit("submit_profile", { ...PROFILE, domains: ["web-auth", "blockchain"] }),
+				(context) => {
+					const result = context.messages.findLast((m) => m.role === "toolResult");
+					toolError = JSON.stringify(result?.content ?? "");
+					return submit("submit_profile", PROFILE);
+				},
+			],
+		});
+		const result = await profileStage(await resolveScope(root, "full"), env.makeDeps(root), []);
+		assert.match(toolError, /Unknown domain \\"blockchain\\"\. Allowed domains: web-auth, client-side, ai-agents, supply-chain, cloud-deployment, rpc-messaging, data-isolation, native-memory, desktop-mobile-ipc\./);
+		assert.deepEqual(result.profile, PROFILE);
+	});
+
 	test("refreshes the profile in full mode", async () => {
 		const root = makeFixtureRepo();
 		const env = await setup({ "Agent: profile": [submit("submit_profile", PROFILE)] });
@@ -128,6 +147,16 @@ describe("hunt partitioning", () => {
 		const scope = await resolveScope(makeFixtureRepo(), "diff");
 		const assignments = huntAssignments(scope);
 		assert.deepEqual(assignments.map((a) => a.label), VULN_CLASSES.map((c) => c.id));
+		assert.deepEqual(assignments.map((a) => a.label), [
+			"injection",
+			"access-control",
+			"secrets-crypto",
+			"files-deserialization",
+			"network-ssrf",
+			"logic-concurrency",
+			"feature-abuse",
+			"wildcard",
+		]);
 		for (const assignment of assignments) {
 			assert.equal(assignment.kind, "class");
 			assert.deepEqual(assignment.files, scope.files);
@@ -210,7 +239,7 @@ describe("hunt partitioning", () => {
 		]);
 		assert.deepEqual(hunt.verify.map((h) => h.id), ["H-001"]);
 		assert.deepEqual(hunt.overflow.map((h) => h.id), ["H-002"]);
-		assert.equal(agents.length, 7);
+		assert.equal(agents.length, 9);
 		assert.equal(agents.at(-1)!.label, "triage");
 		assert.deepEqual(env.progress.at(-1), { stage: "triage" });
 	});
@@ -256,7 +285,7 @@ describe("hunt re-runs", () => {
 		assert.equal(agents.some((a) => a.label.includes("re-run")), false);
 		assert.equal(agents.length, VULN_CLASSES.length);
 		assert.deepEqual(hunt.failures.map((f) => f.label).sort(), ["hunt:injection", "hunt:network-ssrf"]);
-		assert.deepEqual(env.progress.at(-1), { stage: "hunt", done: 6, total: 6 });
+		assert.deepEqual(env.progress.at(-1), { stage: "hunt", done: 8, total: 8 });
 	});
 });
 
@@ -269,8 +298,8 @@ describe("failure reasons", () => {
 	});
 
 	test("identical failures collapse into one reason with at most three labels", () => {
-		const labels = ["hunt:a", "hunt:b", "hunt:c", "hunt:d", "hunt:e", "hunt:f"];
-		assert.deepEqual(failureReasons("hunt", labels.map((l) => failed(l, "refused"))), ["6 hunt agents failed (hunt:a, hunt:b, hunt:c and 3 more): refused"]);
+		const labels = ["hunt:a", "hunt:b", "hunt:c", "hunt:d", "hunt:e", "hunt:f", "hunt:g", "hunt:h"];
+		assert.deepEqual(failureReasons("hunt", labels.map((l) => failed(l, "refused"))), ["8 hunt agents failed (hunt:a, hunt:b, hunt:c and 5 more): refused"]);
 		assert.deepEqual(failureReasons("hunt", labels.slice(0, 2).map((l) => failed(l, "refused"))), ["2 hunt agents failed (hunt:a, hunt:b): refused"]);
 	});
 
@@ -573,7 +602,7 @@ describe("end-to-end with scripted model responses", () => {
 		const rerun = labels.indexOf("hunt:injection (re-run):true");
 		assert.ok(labels.includes("hunt:injection:false"), labels.join(", "));
 		assert.ok(rerun > Math.max(...labels.map((l, i) => (l.startsWith("hunt:") && !l.includes("re-run") ? i : -1))), "re-run starts after the batch");
-		assert.deepEqual(env.progress.filter((p) => p.stage === "hunt").at(-1), { stage: "hunt", done: 7, total: 7 });
+		assert.deepEqual(env.progress.filter((p) => p.stage === "hunt").at(-1), { stage: "hunt", done: 9, total: 9 });
 	});
 
 	test("a refused profile request stops the run before hunting", async () => {

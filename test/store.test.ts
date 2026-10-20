@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFil
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
-import type { Finding, RunRecord, ScopeMode } from "../extensions/security-review/schema.ts";
+import type { Finding, Profile, RunRecord, ScopeMode } from "../extensions/security-review/schema.ts";
 import {
 	assertStoreTrusted,
 	emptyStore,
@@ -307,13 +307,14 @@ describe("mergeRun fallback matching", () => {
 });
 
 describe("profile cache", () => {
-	const profile = {
+	const profile: Profile = {
 		summary: "API",
 		stack: ["typescript"],
 		entry_points: [],
 		trust_boundaries: [],
 		auth_model: "none",
 		external_inputs: [],
+		domains: ["web-auth"],
 	};
 
 	test("hits on an unchanged project fingerprint and misses after a manifest change", async () => {
@@ -329,6 +330,14 @@ describe("profile cache", () => {
 		const changed = await projectFingerprint(root);
 		assert.notEqual(changed, fp);
 		assert.equal(loadCachedProfile(root, changed), undefined);
+	});
+
+	test("a cached profile from an earlier version without domains is not used", async () => {
+		const root = makeRepo({ "package.json": '{"name":"a"}' });
+		const fp = await projectFingerprint(root);
+		const { domains: _domains, ...older } = profile;
+		saveProfile(root, fp, older as Profile, "t1");
+		assert.equal(loadCachedProfile(root, fp), undefined);
 	});
 
 	test("misses after a new top-level directory appears", async () => {
@@ -355,7 +364,7 @@ describe("store trust", () => {
 		const root = makeRepo();
 		sh(root, "checkout", "-q", "-b", "feature");
 		saveStore(root, emptyStore());
-		saveProfile(root, "fp", { summary: "s", stack: ["js"], entry_points: [], trust_boundaries: [], auth_model: "none", external_inputs: [] }, "now");
+		saveProfile(root, "fp", { summary: "s", stack: ["js"], entry_points: [], trust_boundaries: [], auth_model: "none", external_inputs: [], domains: [] }, "now");
 		sh(root, "add", "-f", ".security-review");
 		commitAll(root, "add a store");
 		for (const scope of [{ root, mergeBase: mergeBase(root) }, { root }]) {

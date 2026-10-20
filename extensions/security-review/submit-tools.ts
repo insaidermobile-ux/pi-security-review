@@ -11,10 +11,12 @@ import {
 	type Anchor,
 	type ChallengeArgument,
 	ChallengeArgument as ChallengeArgumentSchema,
+	DOMAINS,
+	type Domain,
 	type HypothesisInput,
 	HypothesisInput as HypothesisInputSchema,
 	type Profile,
-	ProfileInput,
+	ProfileSubmission,
 	SummaryInput,
 	type TriageInput,
 	TriageInput as TriageInputSchema,
@@ -59,10 +61,12 @@ export function createProfileTool(collector: ProfileCollector): ToolDefinition {
 		name: "submit_profile",
 		label: "Submit project profile",
 		description: "Submit the project profile. Call exactly once when your investigation is complete.",
-		parameters: ProfileInput,
+		parameters: ProfileSubmission,
 		outputSchema: Receipt,
 		async execute(_id, params) {
-			collector.profile = params;
+			const unknown = params.domains.filter((id) => !(DOMAINS as readonly string[]).includes(id));
+			if (unknown.length > 0) throw new Error(`Unknown domain ${unknown.map((id) => JSON.stringify(id)).join(", ")}. Allowed domains: ${DOMAINS.join(", ")}.`);
+			collector.profile = { ...params, domains: params.domains as Domain[] };
 			return receipt("Profile recorded. You are done.", true);
 		},
 	}) as unknown as ToolDefinition;

@@ -51,6 +51,23 @@ export const PathStep = Type.Object(
 );
 export type PathStep = Static<typeof PathStep>;
 
+/** Security domains the profile can select; each has guidance in `roles/domains/<id>.md`. */
+export const DOMAINS = [
+	"web-auth",
+	"client-side",
+	"ai-agents",
+	"supply-chain",
+	"cloud-deployment",
+	"rpc-messaging",
+	"data-isolation",
+	"native-memory",
+	"desktop-mobile-ipc",
+] as const;
+export const Domain = Type.Enum(DOMAINS);
+export type Domain = Static<typeof Domain>;
+export const MAX_DOMAINS = 4;
+const DOMAINS_DESCRIPTION = `Up to ${MAX_DOMAINS} security domains with real attack surface in this project, most relevant first; an empty list when none applies. Allowed: ${DOMAINS.join(", ")}`;
+
 export const ProfileInput = Type.Object(
 	{
 		summary: Text("One paragraph describing what the project does"),
@@ -60,10 +77,23 @@ export const ProfileInput = Type.Object(
 		auth_model: Text("How authentication and authorization work, or that there is none"),
 		external_inputs: Type.Array(Type.String(), { description: "Kinds of attacker-influenced input" }),
 		sensitive_assets: Type.Optional(Type.Array(Type.String())),
+		domains: Type.Array(Domain, { maxItems: MAX_DOMAINS, uniqueItems: true, description: DOMAINS_DESCRIPTION }),
 	},
 	{ additionalProperties: false },
 );
 export type Profile = Static<typeof ProfileInput>;
+
+/**
+ * The `submit_profile` parameters: domains are plain strings here so that the tool, not schema
+ * validation, rejects an unknown id, with an error that names the allowed domains.
+ */
+export const ProfileSubmission = Type.Object(
+	{
+		...ProfileInput.properties,
+		domains: Type.Array(Type.String(), { maxItems: MAX_DOMAINS, uniqueItems: true, description: DOMAINS_DESCRIPTION }),
+	},
+	{ additionalProperties: false },
+);
 
 export const HypothesisInput = Type.Object(
 	{

@@ -2,14 +2,16 @@ You are a hunting agent of a security review. You look for candidate vulnerabili
 
 {{common}}
 
+{{severity}}
+
 ## What makes a good hypothesis
 
 - A concrete source of attacker influence (request parameter, uploaded file, message field, environment controlled by a less trusted actor) that reaches a concrete dangerous sink (query execution, command execution, file open, deserialization, template rendering, outbound request, privileged state change, secret disclosure).
 - Or a missing or broken control on a security-relevant operation (authorization check absent on one route but present on its siblings, token comparison that is not constant time, predictable secret, disabled certificate verification).
 - Anchored at existing `path:line` locations you have read. The first anchor is where the flaw manifests. Set `function` to the exact name of the enclosing function or method as written in the code (for example `searchUsers`), not a description; omit it at module level.
 - `suspected_sink` starts with the API or function name of the sink, for example `db.query`, `child_process.exec`, `fs.readFile`, `yaml.load`, `res.redirect`, followed by a few words if needed.
-- `vuln_type` is a short kebab-case tag such as `sql-injection`, `command-injection`, `path-traversal`, `ssrf`, `xss`, `missing-authz`, `idor`, `insecure-deserialization`, `hardcoded-secret`, `weak-crypto`, `open-redirect`, `race-condition`, `xxe`, `prototype-pollution`.
-- `severity_estimate` reflects impact if the hypothesis is true.
+- `vuln_type` is a short kebab-case tag such as `sql-injection`, `command-injection`, `path-traversal`, `ssrf`, `xss`, `missing-authz`, `idor`, `insecure-deserialization`, `hardcoded-secret`, `weak-crypto`, `open-redirect`, `race-condition`, `xxe`, `prototype-pollution`, `data-exposure`, `enumeration`.
+- `severity_estimate` reflects impact if the hypothesis is true, rated with the severity definitions above.
 
 ## What not to submit
 

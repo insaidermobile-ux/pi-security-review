@@ -37,7 +37,17 @@ describe("schemas", () => {
 	});
 
 	test("rejects a profile without stack", () => {
-		assert.ok(validate(ProfileInput, { summary: "x", stack: [], entry_points: [], trust_boundaries: [], auth_model: "none", external_inputs: [] }).length > 0);
+		assert.ok(validate(ProfileInput, { summary: "x", stack: [], entry_points: [], trust_boundaries: [], auth_model: "none", external_inputs: [], domains: [] }).length > 0);
+	});
+
+	test("profile domains come from the fixed list, at most four", () => {
+		const profile = { summary: "x", stack: ["js"], entry_points: [], trust_boundaries: [], auth_model: "none", external_inputs: [] };
+		assert.deepEqual(validate(ProfileInput, { ...profile, domains: [] }), []);
+		assert.deepEqual(validate(ProfileInput, { ...profile, domains: ["ai-agents", "supply-chain", "web-auth", "client-side"] }), []);
+		assert.ok(validate(ProfileInput, profile).some((e) => e.includes("domains")), "missing field");
+		assert.ok(validate(ProfileInput, { ...profile, domains: ["blockchain"] }).length > 0, "unknown id");
+		assert.ok(validate(ProfileInput, { ...profile, domains: ["ai-agents", "supply-chain", "web-auth", "client-side", "cloud-deployment"] }).length > 0, "five domains");
+		assert.ok(validate(ProfileInput, { ...profile, domains: ["web-auth", "web-auth"] }).length > 0, "repeated domain");
 	});
 });
 

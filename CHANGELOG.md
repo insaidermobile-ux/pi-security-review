@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Shared severity definitions for hunters, affirmers, and challenger agents: a path that fully defeats an explicit control ranks above one that only weakens it, and severity never exceeds the impact shown in code.
+- Two hunt classes, feature abuse and data exposure, and a wildcard class, so default mode runs eight hunt agents. Access control, injection, and business logic hunters get more specific questions.
+- Profile domains: the profile agent picks up to four of nine security domains. Hunters receive each domain's attack classes and verification agents its rules for what counts as a finding. Domain guidance and severity definitions are adapted from Cloudflare's security-audit-skill (MIT, see `THIRD_PARTY_NOTICES.md`).
+
+### Changed
+
+- A cached `profile.json` without `domains` is regenerated once.
+
 ### Security
 
 - The audit agents' `shell` tool now path-checks values attached to git short options, such as `git diff -O/abs/file`, `git blame -S/abs/file`, and `git ls-files -X/abs/file`. Before, these values skipped the check, and git's error messages let an agent learn whether a file outside the project exists.

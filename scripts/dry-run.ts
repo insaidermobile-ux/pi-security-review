@@ -58,6 +58,7 @@ if (which === "profile" || which === "all" || which === "hunt") {
 	console.log(JSON.stringify(profile, null, 2));
 	if (which !== "hunt") {
 		check(profile !== undefined && validate(ProfileInput, profile).length === 0, "profile: schema-valid profile submitted");
+		check(profile?.domains.includes("web-auth") === true, `profile: domains include web-auth (${profile?.domains.join(", ") || "none"})`);
 		check(JSON.stringify(profile ?? {}).includes("server.js"), "profile: entry points reference src/server.js");
 	}
 }
