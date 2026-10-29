@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
-import { candidateLabel } from "../extensions/security-review/partition.ts";
-import { affirmerPrompt, challengerPrompt, domainGuidance, huntPrompt, systemPrompt, triagePrompt, VULN_CLASSES } from "../extensions/security-review/prompts.ts";
+import { candidateLabel, type HuntAssignment, VULN_CLASSES } from "../extensions/security-review/partition.ts";
+import { affirmerPrompt, challengerPrompt, domainGuidance, huntPrompt, systemPrompt, triagePrompt } from "../extensions/security-review/prompts.ts";
 import { DOMAINS, type Hypothesis, type Profile } from "../extensions/security-review/schema.ts";
-import type { Scope } from "../extensions/security-review/scope.ts";
+import type { DiffScope, Scope } from "../extensions/security-review/scope.ts";
 import { affirm, hypothesisInput } from "./fixtures.ts";
+
+const fullScope: Scope = { mode: "full", root: "/repo", files: ["src/a.ts"] };
+const diffScope: DiffScope = { mode: "diff", root: "/repo", files: ["src/a.ts"], baseRef: "main", mergeBase: "abc", diff: "+x", diffTruncated: false, untracked: [] };
+
+function classAssignment(id: string): HuntAssignment {
+	const vulnClass = VULN_CLASSES.find((c) => c.id === id)!;
+	return { label: vulnClass.id, kind: "class", title: vulnClass.title, focus: vulnClass.focus, files: ["src/a.ts"] };
+}
 
 describe("triage prompt", () => {
 	const candidates = [
@@ -36,20 +44,19 @@ describe("verification prompts with consequences", () => {
 		...plain,
 		consequences: [{ vuln_type: "secret-disclosure", description: "UNIQUE-CONSEQUENCE", anchors: [{ file: "src/users.ts", line: 12 }] }],
 	};
-	const scope = { mode: "full" } as never;
 
 	test("affirmer and challenger see a Consequences section only when there are consequences", () => {
-		for (const prompt of [affirmerPrompt(undefined, grouped, scope), challengerPrompt(undefined, grouped, affirm("H-001"))]) {
+		for (const prompt of [affirmerPrompt(undefined, grouped, fullScope), challengerPrompt(undefined, grouped, affirm("H-001"))]) {
 			assert.match(prompt, /## Consequences[\s\S]*UNIQUE-CONSEQUENCE/);
 			assert.match(prompt, /The verdict is about the hypothesis itself/);
 		}
-		for (const prompt of [affirmerPrompt(undefined, plain, scope), challengerPrompt(undefined, plain, affirm("H-001"))]) {
+		for (const prompt of [affirmerPrompt(undefined, plain, fullScope), challengerPrompt(undefined, plain, affirm("H-001"))]) {
 			assert.doesNotMatch(prompt, /Consequences/);
 		}
 	});
 
 	test("the hypothesis JSON does not repeat consequences or internal fields", () => {
-		const prompt = affirmerPrompt(undefined, grouped, scope);
+		const prompt = affirmerPrompt(undefined, grouped, fullScope);
 		assert.equal(prompt.split("UNIQUE-CONSEQUENCE").length, 2);
 		assert.doesNotMatch(prompt, /fingerprint|source_partition/);
 	});
@@ -90,14 +97,8 @@ describe("severity definitions", () => {
 });
 
 describe("vulnerability classes in hunt prompts", () => {
-	const diffScope: Scope = { mode: "diff", root: "/repo", files: ["src/a.ts"], baseRef: "main", mergeBase: "abc", diff: "" };
-	const classAssignment = (id: string) => {
-		const vulnClass = VULN_CLASSES.find((c) => c.id === id)!;
-		return { label: vulnClass.id, kind: "class" as const, title: vulnClass.title, focus: vulnClass.focus, files: ["src/a.ts"] };
-	};
-
 	test("a full-mode hunt prompt lists all eight classes", () => {
-		const prompt = huntPrompt(undefined, { mode: "full", root: "/repo", files: ["src/a.ts"] }, { label: "src", kind: "subtree", title: "Subtree src", files: ["src/a.ts"] });
+		const prompt = huntPrompt(undefined, fullScope, { label: "src", kind: "subtree", title: "Subtree src", files: ["src/a.ts"] });
 		assert.equal(VULN_CLASSES.length, 8);
 		for (const vulnClass of VULN_CLASSES) assert.ok(prompt.includes(`- **${vulnClass.title}**: ${vulnClass.focus}`), vulnClass.id);
 		assert.match(prompt, /Feature abuse and data exposure/);
@@ -108,7 +109,7 @@ describe("vulnerability classes in hunt prompts", () => {
 		const note = /This class has no fixed category\. Do not repeat what the other classes cover[\s\S]*same evidence bar/;
 		assert.match(huntPrompt(undefined, diffScope, classAssignment("wildcard")), note);
 		for (const vulnClass of VULN_CLASSES.filter((c) => c.id !== "wildcard")) assert.doesNotMatch(huntPrompt(undefined, diffScope, classAssignment(vulnClass.id)), note, vulnClass.id);
-		assert.doesNotMatch(huntPrompt(undefined, { mode: "full", root: "/repo", files: ["src/a.ts"] }, { label: "src", kind: "subtree", title: "Subtree src", files: ["src/a.ts"] }), note);
+		assert.doesNotMatch(huntPrompt(undefined, fullScope, { label: "src", kind: "subtree", title: "Subtree src", files: ["src/a.ts"] }), note);
 	});
 
 	test("the hunt role lists the new example tags", () => {
@@ -122,7 +123,7 @@ describe("diff-mode hunt prompt", () => {
 		const vulnClass = VULN_CLASSES[0]!;
 		const prompt = huntPrompt(
 			undefined,
-			{ mode: "diff", root: "/repo", files: ["README.md"], baseRef: "main", mergeBase: "abc", diff },
+			{ ...diffScope, files: ["README.md"], diff },
 			{ label: vulnClass.id, kind: "class", title: vulnClass.title, focus: vulnClass.focus, files: ["README.md"] },
 		);
 		assert.ok(prompt.includes(`\`\`\`\`\`diff\n${diff.trimEnd()}\n\`\`\`\`\`\n`));
@@ -162,15 +163,10 @@ describe("domain sections in prompts", () => {
 		external_inputs: [],
 		domains: ["supply-chain", "ai-agents"],
 	};
-	const diffScope: Scope = { mode: "diff", root: "/repo", files: ["src/a.ts"], baseRef: "main", mergeBase: "abc", diff: "+x" };
-	const assignment = (id: string) => {
-		const vulnClass = VULN_CLASSES.find((c) => c.id === id)!;
-		return { label: vulnClass.id, kind: "class" as const, title: vulnClass.title, focus: vulnClass.focus, files: ["src/a.ts"] };
-	};
 	const hypothesis: Hypothesis = { ...hypothesisInput(), id: "H-001", source_partition: "injection", fingerprint: "fp" };
 
 	test("hunters of one run share an identical prefix up to the agent header, with domain guidance after the profile", () => {
-		const prompts = ["injection", "wildcard"].map((id) => huntPrompt(profile, diffScope, assignment(id)));
+		const prompts = ["injection", "wildcard"].map((id) => huntPrompt(profile, diffScope, classAssignment(id)));
 		const prefixes = prompts.map((p) => p.slice(0, p.indexOf("Agent: hunt:")));
 		assert.equal(prefixes[0], prefixes[1]);
 		const prefix = prefixes[0]!;
@@ -181,7 +177,7 @@ describe("domain sections in prompts", () => {
 	});
 
 	test("domains appear in profile order", () => {
-		const prompt = huntPrompt(profile, { mode: "full", root: "/repo", files: ["src/a.ts"] }, { label: "src", kind: "subtree", title: "Subtree src", files: ["src/a.ts"] });
+		const prompt = huntPrompt(profile, fullScope, { label: "src", kind: "subtree", title: "Subtree src", files: ["src/a.ts"] });
 		const supply = prompt.indexOf(`### ${domainGuidance("supply-chain").title}`);
 		const ai = prompt.indexOf(`### ${domainGuidance("ai-agents").title}`);
 		assert.ok(supply > 0 && ai > supply, `${supply} ${ai}`);
@@ -201,7 +197,7 @@ describe("domain sections in prompts", () => {
 
 	test("no domain section without a profile or with no domains", () => {
 		for (const p of [undefined, { ...profile, domains: [] }]) {
-			for (const prompt of [huntPrompt(p, diffScope, assignment("injection")), affirmerPrompt(p, hypothesis, diffScope), challengerPrompt(p, hypothesis, affirm("H-001"))]) {
+			for (const prompt of [huntPrompt(p, diffScope, classAssignment("injection")), affirmerPrompt(p, hypothesis, diffScope), challengerPrompt(p, hypothesis, affirm("H-001"))]) {
 				assert.doesNotMatch(prompt, /## Domain (guidance|validation rules)/);
 			}
 		}

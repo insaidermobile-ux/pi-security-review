@@ -22,18 +22,26 @@ export class ScopeError extends Error {
 	}
 }
 
-export interface Scope {
-	mode: ScopeMode;
+export interface FullScope {
+	mode: "full";
 	/** Absolute path of the git work tree root; all file paths are relative to it. */
 	root: string;
 	files: string[];
-	/** Diff mode only. */
-	baseRef?: string;
-	mergeBase?: string;
-	diff?: string;
-	diffTruncated?: boolean;
-	untracked?: string[];
 }
+
+export interface DiffScope {
+	mode: "diff";
+	/** Absolute path of the git work tree root; all file paths are relative to it. */
+	root: string;
+	files: string[];
+	baseRef: string;
+	mergeBase: string;
+	diff: string;
+	diffTruncated: boolean;
+	untracked: string[];
+}
+
+export type Scope = FullScope | DiffScope;
 
 interface GitResult {
 	code: number;
@@ -217,6 +225,9 @@ export interface ResolveScopeOptions {
 	exclude?: readonly string[];
 }
 
+export async function resolveScope(cwd: string, mode: "full", options?: ResolveScopeOptions): Promise<FullScope>;
+export async function resolveScope(cwd: string, mode: "diff", options?: ResolveScopeOptions): Promise<DiffScope>;
+export async function resolveScope(cwd: string, mode: ScopeMode, options?: ResolveScopeOptions): Promise<Scope>;
 export async function resolveScope(cwd: string, mode: ScopeMode, options: ResolveScopeOptions = {}): Promise<Scope> {
 	const exclude = options.exclude ?? [];
 	const root = await findRepoRoot(cwd);
@@ -225,7 +236,7 @@ export async function resolveScope(cwd: string, mode: ScopeMode, options: Resolv
 		const listed = splitZ(await gitOk(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], "Listing project files"));
 		const files = finalize(root, listed, exclude);
 		if (files.length === 0) throw new ScopeError("empty", "There are no files to audit in this project after applying excludes.");
-		return { mode, root, files };
+		return { mode: "full", root, files };
 	}
 
 	const baseRef = await resolveBaseRef(root);
@@ -261,7 +272,7 @@ export async function resolveScope(cwd: string, mode: ScopeMode, options: Resolv
 	}
 	const diffTruncated = Buffer.byteLength(diff) > MAX_DIFF_BYTES;
 	if (diffTruncated) diff = Buffer.from(diff).subarray(0, MAX_DIFF_BYTES).toString();
-	return { mode, root, files, baseRef, mergeBase, diff, diffTruncated, untracked };
+	return { mode: "diff", root, files, baseRef, mergeBase, diff, diffTruncated, untracked };
 }
 
 /**
@@ -269,8 +280,8 @@ export async function resolveScope(cwd: string, mode: ScopeMode, options: Resolv
  * changed in the working tree, or undefined when unknown.
  */
 export async function introducedIn(scope: Scope, file: string): Promise<string | undefined> {
-	if (scope.mode !== "diff" || !scope.mergeBase) return undefined;
-	if (scope.untracked?.includes(file)) return "uncommitted";
+	if (scope.mode !== "diff") return undefined;
+	if (scope.untracked.includes(file)) return "uncommitted";
 	const log = await git(scope.root, [LITERAL_PATHS, "log", "-n", "1", "--format=%H", `${scope.mergeBase}..HEAD`, "--", file]);
 	const sha = log.stdout.trim();
 	if (log.code === 0 && sha) return sha;

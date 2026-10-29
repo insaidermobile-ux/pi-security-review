@@ -120,15 +120,6 @@ export const Consequence = Type.Object(
 );
 export type Consequence = Static<typeof Consequence>;
 
-export interface Hypothesis extends HypothesisInput {
-	id: string;
-	/** Label of the hunt partition that produced it. */
-	source_partition: string;
-	fingerprint: string;
-	/** Other hypotheses folded into this one by triage because the same fix removes them. */
-	consequences?: Consequence[];
-}
-
 export const TriageInput = Type.Object(
 	{
 		groups: Type.Array(
@@ -223,8 +214,8 @@ export const SummaryInput = Type.Object(
 	{ additionalProperties: false },
 );
 
-export const Finding = Type.Object({
-	id: Type.String({ pattern: "^SR-[0-9]{3,}$" }),
+/** A finding produced by a run, before the store assigns identity and lifecycle fields. */
+export const NewFinding = Type.Object({
 	fingerprint: Type.String({ minLength: 1 }),
 	title: Type.String({ minLength: 1 }),
 	finding_class: Type.Union([Type.Literal("vulnerability"), Type.Literal("risk")]),
@@ -246,6 +237,12 @@ export const Finding = Type.Object({
 	scope: ScopeMode,
 	introduced_in: Type.Optional(Type.String()),
 	consequences: Type.Optional(Type.Array(Consequence)),
+});
+export type NewFinding = Static<typeof NewFinding>;
+
+export const Finding = Type.Object({
+	...NewFinding.properties,
+	id: Type.String({ pattern: "^SR-[0-9]{3,}$" }),
 	status: FindingStatus,
 	first_seen: Type.String(),
 	last_seen: Type.String(),
@@ -254,11 +251,14 @@ export type Finding = Static<typeof Finding>;
 
 export const StoredHypothesis = Type.Object({
 	id: Type.String(),
+	/** Label of the hunt partition that produced it. */
 	source_partition: Type.String(),
 	fingerprint: Type.String(),
 	...HypothesisInput.properties,
+	/** Other hypotheses folded into this one by triage because the same fix removes them. */
 	consequences: Type.Optional(Type.Array(Consequence)),
 });
+export type Hypothesis = Static<typeof StoredHypothesis>;
 
 export const RefutedHypothesis = Type.Object({
 	hypothesis: StoredHypothesis,

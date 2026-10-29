@@ -1,5 +1,4 @@
 import { normalizeVulnType } from "./fingerprint.ts";
-import { type HuntAssignment, VULN_CLASSES } from "./prompts.ts";
 import { type Anchor, type Consequence, type HypothesisInput, type Severity, severityRank } from "./schema.ts";
 import type { Scope } from "./scope.ts";
 
@@ -9,6 +8,67 @@ export const MAX_SUBTREE_AGENTS = 12;
 export const TARGET_FILES_PER_AGENT = 150;
 /** How many times a subtree is split into its subdirectories before it is left as one group. */
 const MAX_SPLIT_LEVELS = 6;
+
+export interface VulnClass {
+	id: string;
+	title: string;
+	focus: string;
+}
+
+/** Vulnerability class clusters used to partition hunting in diff mode. */
+export const VULN_CLASSES: readonly VulnClass[] = [
+	{
+		id: "injection",
+		title: "Injection",
+		focus: "SQL/NoSQL/LDAP/XPath injection, OS command injection, code evaluation (eval, Function, template engines, expression languages), server-side template injection, cross-site scripting, header and log injection. Also second-order injection, where stored data later reaches a dangerous context, and injection through keys, field names, headers, and metadata.",
+	},
+	{
+		id: "access-control",
+		title: "Authentication and authorization",
+		focus: "Missing or inconsistent authorization checks, insecure direct object references, privilege escalation, authentication bypass, session fixation, broken JWT or token validation, CSRF on state-changing endpoints, open redirects used in auth flows. Ask whether each check is the right one for the right resource, whether another path reaches the same state change with a weaker check, whether a body field overrides the restriction, and whether batch, export, and import operations check every item.",
+	},
+	{
+		id: "secrets-crypto",
+		title: "Secrets and cryptography",
+		focus: "Hardcoded credentials and keys, secrets written to logs or responses, weak or misused cryptography (ECB, static IVs, MD5/SHA1 for passwords), non-constant-time secret comparison, predictable random values used for tokens, disabled TLS certificate verification.",
+	},
+	{
+		id: "files-deserialization",
+		title: "Files and deserialization",
+		focus: "Path traversal, arbitrary file read or write, unsafe archive extraction (zip slip), unrestricted uploads, insecure deserialization (pickle, YAML, Java serialization, unsafe JSON revivers), XML external entities, prototype pollution.",
+	},
+	{
+		id: "network-ssrf",
+		title: "Network and SSRF",
+		focus: "Server-side request forgery, URL validation bypasses, DNS rebinding exposure, unsafe proxying, overly permissive CORS, exposure of internal services, webhook and callback handling.",
+	},
+	{
+		id: "logic-concurrency",
+		title: "Business logic and concurrency",
+		focus: "Race conditions and TOCTOU in security-relevant operations, double spending, broken state machines, missing rate limits on credential or payment operations, trust in client-supplied prices, roles, or identifiers. Also partial failure without rollback, replay of completed flows, behavior when configuration is missing or a feature flag is off, and expiry and time-window boundaries.",
+	},
+	{
+		id: "feature-abuse",
+		title: "Feature abuse and data exposure",
+		focus: "Features used as designed to reach data or actions above the caller's access: export or backup that includes data the caller cannot otherwise read, import or restore that bypasses validation or permissions, search, filter, or sort used as an oracle, enumeration through error text, status codes, or timing, preview or draft tokens with broad scope, and notification or webhook URLs fetched by the server.",
+	},
+	{
+		id: "wildcard",
+		title: "Unusual and overlooked code",
+		focus: "Strange, half-finished, experimental, compatibility, and fallback code, API endpoints the client never calls, undocumented routes and parameters, features combined in ways nobody designed for, security-relevant git history, and comments that claim safety without proof.",
+	},
+];
+
+export interface HuntAssignment {
+	/** Stable partition label, e.g. "injection" or "src/api". */
+	label: string;
+	kind: "class" | "subtree";
+	title: string;
+	/** Vulnerability focus for class partitions. */
+	focus?: string;
+	/** Files owned by the assignment. */
+	files: string[];
+}
 
 export function huntAssignments(scope: Scope): HuntAssignment[] {
 	if (scope.mode === "diff") {
@@ -96,11 +156,13 @@ export function mergeDuplicateHypotheses(hypotheses: readonly TaggedHypothesis[]
 			merged.push({ ...hypothesis, anchors: [...hypothesis.anchors] });
 			continue;
 		}
+		// The more severe claim wins and keeps the primary anchor, which the fingerprint and title use.
 		const keepIncoming = severityRank(hypothesis.severity_estimate) < severityRank(match.severity_estimate);
-		const anchors = [...(keepIncoming ? hypothesis.anchors : match.anchors), ...(keepIncoming ? match.anchors : hypothesis.anchors)];
-		const unique = anchors.filter((anchor, i) => anchors.findIndex((other) => other.file === anchor.file && other.line === anchor.line) === i);
+		const [keep, other] = keepIncoming ? [hypothesis, match] : [match, hypothesis];
+		const anchors = [...keep.anchors, ...other.anchors];
+		const unique = anchors.filter((anchor, i) => anchors.findIndex((earlier) => earlier.file === anchor.file && earlier.line === anchor.line) === i);
 		const partitions = new Set([...match.source_partition.split(", "), hypothesis.source_partition]);
-		Object.assign(match, keepIncoming ? { ...hypothesis } : {}, { anchors: unique, source_partition: [...partitions].join(", ") });
+		Object.assign(match, { ...keep, anchors: unique, source_partition: [...partitions].join(", ") });
 	}
 	return merged;
 }

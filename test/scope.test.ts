@@ -50,8 +50,8 @@ describe("default (diff) scope", () => {
 		assert.equal(scope.baseRef, "main");
 		assert.deepEqual(scope.files, ["src/committed.ts", "src/new.ts", "src/old.ts"]);
 		assert.deepEqual(scope.untracked, ["src/new.ts"]);
-		assert.match(scope.diff!, /src\/committed\.ts/);
-		assert.match(scope.diff!, /export const a = 3/);
+		assert.match(scope.diff, /src\/committed\.ts/);
+		assert.match(scope.diff, /export const a = 3/);
 	});
 
 	test("skips files deleted on the branch", async () => {
@@ -104,7 +104,7 @@ describe("full scope", () => {
 		write(root, "dist/out.js", "1\n");
 		const scope = await resolveScope(root, "full", { exclude: ["vendor/**", "*.md"] });
 		assert.deepEqual(scope.files, [".gitignore", "src/a.ts", "src/untracked.ts"]);
-		assert.equal(scope.diff, undefined);
+		assert.equal("diff" in scope, false);
 	});
 });
 
@@ -152,8 +152,8 @@ describe("literal paths", () => {
 		write(root, "pages/[id].tsx", "export const dynamic = 3;\n");
 		const scope = await resolveScope(root, "diff", { exclude: ["pages/i.tsx"] });
 		assert.deepEqual(scope.files, ["pages/[id].tsx"]);
-		assert.match(scope.diff!, /dynamic = 3/);
-		assert.doesNotMatch(scope.diff!, /other = 2/);
+		assert.match(scope.diff, /dynamic = 3/);
+		assert.doesNotMatch(scope.diff, /other = 2/);
 		assert.equal(await introducedIn(scope, "pages/[id].tsx"), "uncommitted");
 		assert.notEqual(await introducedIn(scope, "pages/[id].tsx"), sha);
 	});

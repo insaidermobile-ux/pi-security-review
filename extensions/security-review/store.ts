@@ -2,10 +2,19 @@ import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, type Stats, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { normalizePath, normalizeVulnType } from "./fingerprint.ts";
-import { git, resolveBaseRef, type Scope, STORE_DIR } from "./scope.ts";
-import { type Anchor, type Finding, type Profile, ProfileInput, type RunRecord, type StoreFile, StoreFile as StoreFileSchema, validate } from "./schema.ts";
+import { git, resolveBaseRef, STORE_DIR } from "./scope.ts";
+import {
+	type Anchor,
+	type Finding,
+	type NewFinding,
+	type Profile,
+	ProfileInput,
+	type RunRecord,
+	type StoreFile,
+	StoreFile as StoreFileSchema,
+	validate,
+} from "./schema.ts";
 
-export { STORE_DIR };
 export const FINDINGS_FILE = "findings.json";
 export const REPORT_FILE = "report.md";
 export const PROFILE_FILE = "profile.json";
@@ -98,7 +107,7 @@ async function defaultBranchMergeBase(root: string): Promise<string | undefined>
  * those commits instead, who could use it to hide a finding. Such a run is refused before any model call.
  * Uncommitted changes are local and stay trusted.
  */
-export async function assertStoreTrusted(scope: Pick<Scope, "root" | "mergeBase">): Promise<void> {
+export async function assertStoreTrusted(scope: { root: string; mergeBase?: string }): Promise<void> {
 	assertStoreLocal(scope.root);
 	const files = [FINDINGS_FILE, PROFILE_FILE].map((file) => `${STORE_DIR}/${file}`);
 	const listed = await git(scope.root, ["ls-files", "-z", "--", ...files]);
@@ -157,9 +166,6 @@ export function saveStore(root: string, store: StoreFile, hooks?: AtomicWriteHoo
 export function writeRunLog(root: string, run: RunRecord & Record<string, unknown>): string {
 	return writeStoreFile(root, join(RUNS_DIR, `${run.id}.json`), `${JSON.stringify(run, null, 2)}\n`);
 }
-
-/** A finding produced by a run, before the store assigns identity and lifecycle fields. */
-export type NewFinding = Omit<Finding, "id" | "status" | "first_seen" | "last_seen">;
 
 export interface MergeInput {
 	run: Omit<RunRecord, "finding_ids">;

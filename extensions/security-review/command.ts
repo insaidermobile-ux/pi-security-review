@@ -8,8 +8,9 @@ import { type ScopeMode, SEVERITIES, severityRank } from "./schema.ts";
 import { resolveScope, ScopeError } from "./scope.ts";
 import { resolveRoleModels, resolveSettings } from "./settings.ts";
 import { readSettingsLayers } from "./settings-source.ts";
-import { plural, STALE_SKIPPED_NOTE, stripControl } from "./report.ts";
+import { STALE_SKIPPED_NOTE } from "./report.ts";
 import { StoreError, staleMarkingSkipped } from "./store.ts";
+import { plural, stripControl } from "./text.ts";
 
 export const COMMAND_NAME = "security-review";
 export const STATUS_KEY = "security-review";
@@ -59,8 +60,29 @@ function bySeverity(result: RunResult): string {
 	return `By severity: ${SEVERITIES.map((s) => `${result.counts[s]} ${s}`).join(", ")}.`;
 }
 
-function orderedFindings(result: RunResult) {
-	return [...result.findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.id.localeCompare(b.id));
+function confirmedText(result: RunResult): string {
+	const vulnerabilities = result.findings.filter((f) => f.finding_class === "vulnerability").length;
+	const risks = result.findings.length - vulnerabilities;
+	return `${plural(vulnerabilities, "vulnerability", "vulnerabilities")} and ${plural(risks, "risk")} confirmed; ${result.refuted.length} refuted, ${result.unverified.length} unverified.`;
+}
+
+/** The findings a summary lists, most severe first, and how many more the report has. */
+function listedFindings(result: RunResult) {
+	const ordered = [...result.findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity) || a.id.localeCompare(b.id));
+	return { listed: ordered.slice(0, MAX_LISTED_FINDINGS), more: Math.max(0, ordered.length - MAX_LISTED_FINDINGS) };
+}
+
+/** The closing lines of both summaries. They hold only fixed text, paths, and usage, so the model summary may carry them. */
+function closingLines(result: RunResult, cwd: string, usage: string, options: { gap: boolean; note?: string }): string[] {
+	const rel = (path: string) => relative(cwd, path) || path;
+	return [
+		...(staleMarkingSkipped(result.run) ? [STALE_SKIPPED_NOTE] : []),
+		...(options.gap ? [""] : []),
+		`Report: \`${rel(result.reportPath)}\` · Findings: \`${rel(result.storePath)}\``,
+		`Usage: ${usage}.`,
+		...(options.note ? [options.note] : []),
+		...(result.gitignoreHint ? ["", result.gitignoreHint] : []),
+	];
 }
 
 /**
@@ -75,35 +97,26 @@ function linkFree(text: string): string {
 
 /** Markdown summary shown to the user after a run. It quotes audit agents, so it is never sent to the session's model. */
 export function formatSummary(result: RunResult, cwd: string, usage: string): string {
-	const rel = (path: string) => relative(cwd, path) || path;
-	const vulnerabilities = result.findings.filter((f) => f.finding_class === "vulnerability").length;
-	const risks = result.findings.length - vulnerabilities;
 	const lines = [`**Security review** (${scopeText(result)})`, ""];
 	if (result.findings.length === 0) {
 		lines.push(
 			`No findings were confirmed. ${plural(result.hypotheses.length, "hypothesis", "hypotheses")} raised, ${result.refuted.length} refuted, ${result.unverified.length} unverified.`,
 		);
 	} else {
-		lines.push(
-			`${plural(vulnerabilities, "vulnerability", "vulnerabilities")} and ${plural(risks, "risk")} confirmed; ${result.refuted.length} refuted, ${result.unverified.length} unverified.`,
-			bySeverity(result),
-			"",
-		);
-		const ordered = orderedFindings(result);
-		for (const finding of ordered.slice(0, MAX_LISTED_FINDINGS)) {
+		lines.push(confirmedText(result), bySeverity(result), "");
+		const { listed, more } = listedFindings(result);
+		for (const finding of listed) {
 			const anchor = finding.anchors[0]!;
 			const triaged = finding.status !== "open" ? ` (${finding.status})` : "";
 			const count = finding.consequences?.length ?? 0;
 			const consequences = count ? ` (+${plural(count, "consequence")})` : "";
 			lines.push(`- ${finding.id} [${finding.severity} ${finding.finding_class}] ${linkFree(finding.title)} - \`${anchor.file}:${anchor.line}\`${consequences}${triaged}`);
 		}
-		if (ordered.length > MAX_LISTED_FINDINGS) lines.push(`- ... and ${ordered.length - MAX_LISTED_FINDINGS} more in the report`);
+		if (more) lines.push(`- ... and ${more} more in the report`);
 	}
 	if (result.summary) lines.push("", linkFree(result.summary.trim()));
 	if (!result.run.complete) lines.push("", `**Incomplete run:** ${linkFree(result.run.incomplete_reasons.join("; "))}`);
-	if (staleMarkingSkipped(result.run)) lines.push(STALE_SKIPPED_NOTE);
-	lines.push("", `Report: \`${rel(result.reportPath)}\` · Findings: \`${rel(result.storePath)}\``, `Usage: ${usage}.`);
-	if (result.gitignoreHint) lines.push("", result.gitignoreHint);
+	lines.push(...closingLines(result, cwd, usage, { gap: true }));
 	return stripControl(lines.join("\n"));
 }
 
@@ -116,22 +129,16 @@ export const UNTRUSTED_NOTE =
  * agent, and through it the audited code, could phrase.
  */
 export function formatModelSummary(result: RunResult, cwd: string, usage: string): string {
-	const rel = (path: string) => relative(cwd, path) || path;
-	const vulnerabilities = result.findings.filter((f) => f.finding_class === "vulnerability").length;
-	const lines = [
-		`Security review finished (${scopeText(result)}): ${plural(vulnerabilities, "vulnerability", "vulnerabilities")} and ${plural(result.findings.length - vulnerabilities, "risk")} confirmed; ${result.refuted.length} refuted, ${result.unverified.length} unverified.`,
-	];
+	const lines = [`Security review finished (${scopeText(result)}): ${confirmedText(result)}`];
 	if (result.findings.length > 0) {
-		const ordered = orderedFindings(result);
-		const listed = ordered.slice(0, MAX_LISTED_FINDINGS).map((f) => `${f.id} (${f.severity} ${f.finding_class}${f.status !== "open" ? `, ${f.status}` : ""})`);
-		if (ordered.length > MAX_LISTED_FINDINGS) listed.push(`and ${ordered.length - MAX_LISTED_FINDINGS} more`);
-		lines.push(bySeverity(result), `Findings: ${listed.join(", ")}.`);
+		const { listed, more } = listedFindings(result);
+		const ids = listed.map((f) => `${f.id} (${f.severity} ${f.finding_class}${f.status !== "open" ? `, ${f.status}` : ""})`);
+		if (more) ids.push(`and ${more} more`);
+		lines.push(bySeverity(result), `Findings: ${ids.join(", ")}.`);
 	}
 	if (result.run.incomplete_reasons.includes(CANCELLED_REASON)) lines.push("The review was cancelled before it finished; the results are partial.");
 	else if (!result.run.complete) lines.push("The run was incomplete; the report lists the reasons.");
-	if (staleMarkingSkipped(result.run)) lines.push(STALE_SKIPPED_NOTE);
-	lines.push(`Report: \`${rel(result.reportPath)}\` · Findings: \`${rel(result.storePath)}\``, `Usage: ${usage}.`, UNTRUSTED_NOTE);
-	if (result.gitignoreHint) lines.push("", result.gitignoreHint);
+	lines.push(...closingLines(result, cwd, usage, { gap: false, note: UNTRUSTED_NOTE }));
 	return lines.join("\n");
 }
 

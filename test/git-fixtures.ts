@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tempDir } from "./temp.ts";
 
 const GIT_ENV = {
@@ -46,7 +47,7 @@ export function cloneWithOrigin(source: string): string {
 	return clone;
 }
 
-const FIXTURE_DIR = join(dirname(new URL(import.meta.url).pathname), "fixtures", "vulnerable-app");
+const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "vulnerable-app");
 
 function copyTree(from: string, to: string): void {
 	cpSync(from, to, { recursive: true });

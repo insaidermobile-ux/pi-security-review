@@ -10,8 +10,8 @@ import { getAgentDir, ModelRuntime, SettingsManager } from "@earendil-works/pi-c
 import { type AgentOutcome, createSdkAgentRunner, UsageLedger } from "../extensions/security-review/agent-runtime.ts";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
 import { profileStage, type PipelineDeps } from "../extensions/security-review/pipeline.ts";
-import { huntPrompt, systemPrompt, triagePrompt, VULN_CLASSES } from "../extensions/security-review/prompts.ts";
-import { candidateLabel } from "../extensions/security-review/partition.ts";
+import { huntPrompt, systemPrompt, triagePrompt } from "../extensions/security-review/prompts.ts";
+import { candidateLabel, VULN_CLASSES } from "../extensions/security-review/partition.ts";
 import { type AffirmArgument, AffirmArgument as AffirmSchema, type ChallengeArgument, ChallengeArgument as ChallengeSchema, type Hypothesis, type HypothesisInput, type Profile, ProfileInput, validate } from "../extensions/security-review/schema.ts";
 import { resolveScope } from "../extensions/security-review/scope.ts";
 import { DEFAULT_SETTINGS, ROLES } from "../extensions/security-review/settings.ts";

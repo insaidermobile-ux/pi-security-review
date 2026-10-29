@@ -2,16 +2,25 @@ import { randomBytes } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { type AgentOutcome, type AgentRunner, CANCELLED, emptyUsage } from "./agent-runtime.ts";
 import { fingerprint, formatTitle, normalizeVulnType } from "./fingerprint.ts";
-import { applyHypothesisCap, applyTriageGroups, candidateLabel, huntAssignments, mergeDuplicateHypotheses, type TaggedHypothesis } from "./partition.ts";
+import {
+	applyHypothesisCap,
+	applyTriageGroups,
+	candidateLabel,
+	type HuntAssignment,
+	huntAssignments,
+	mergeDuplicateHypotheses,
+	type TaggedHypothesis,
+} from "./partition.ts";
 import { mapBounded } from "./pool.ts";
-import { affirmerPrompt, challengerPrompt, type HuntAssignment, huntPrompt, profilePrompt, reportPrompt, systemPrompt, triagePrompt } from "./prompts.ts";
+import { affirmerPrompt, challengerPrompt, huntPrompt, profilePrompt, reportPrompt, systemPrompt, triagePrompt } from "./prompts.ts";
 import { countBySeverity, renderReport, type SeverityCounts } from "./report.ts";
 import {
 	type AffirmArgument,
 	type ChallengeArgument,
-	Finding as FindingSchema,
 	type Finding,
 	type Hypothesis,
+	type NewFinding,
+	NewFinding as NewFindingSchema,
 	type Profile,
 	type RefutedHypothesis,
 	type RunRecord,
@@ -28,7 +37,6 @@ import {
 	loadCachedProfile,
 	loadStore,
 	mergeRun,
-	type NewFinding,
 	priorFalsePositives,
 	projectFingerprint,
 	REPORT_FILE,
@@ -203,6 +211,11 @@ export async function triageStage(
 	return { candidates: applyTriageGroups(candidates, collector.groups) };
 }
 
+interface HuntAttempt {
+	outcome: AgentOutcome;
+	hypotheses: TaggedHypothesis[];
+}
+
 /** Hunt stage: parallel agents per partition, then merge duplicates, triage, apply the cap, and assign ids. */
 export async function huntStage(
 	scope: Scope,
@@ -214,12 +227,9 @@ export async function huntStage(
 	let done = 0;
 	let total = assignments.length;
 	deps.onProgress?.({ stage: "hunt", done, total });
-	const perAssignment: TaggedHypothesis[][] = assignments.map(() => []);
-	const outcomes: (AgentOutcome | undefined)[] = assignments.map(() => undefined);
-	const failures: AgentOutcome[] = [];
 	const errors: string[] = [];
 
-	const hunt = async (assignment: HuntAssignment, label: string) => {
+	const hunt = async (assignment: HuntAssignment, label: string): Promise<HuntAttempt> => {
 		const collector: HypothesisCollector = { hypotheses: [] };
 		const outcome = await deps.runner.run(
 			{
@@ -238,37 +248,33 @@ export async function huntStage(
 		// Hypotheses submitted before a failure are schema-valid and still verified.
 		return { outcome, hypotheses: collector.hypotheses.map((h): TaggedHypothesis => ({ ...h, source_partition: assignment.label })) };
 	};
+	const settled = (result: PromiseSettledResult<HuntAttempt>): HuntAttempt =>
+		result.status === "fulfilled" ? result.value : { outcome: thrown("hunt", result.reason), hypotheses: [] };
 
-	const results = await mapBounded(assignments, deps.settings.maxConcurrentAgents, async (assignment, index) => {
-		const attempt = await hunt(assignment, `hunt:${assignment.label}`);
-		perAssignment[index] = attempt.hypotheses;
-		outcomes[index] = attempt.outcome;
-	});
-	for (const result of results) if (result.status === "rejected") failures.push(thrown("hunt", result.reason));
+	// One attempt per assignment, in partition order.
+	const attempts = (await mapBounded(assignments, deps.settings.maxConcurrentAgents, (assignment) => hunt(assignment, `hunt:${assignment.label}`))).map(settled);
 
 	// A hunter that failed on a transient provider error (usually a rate limit) is run once more after
 	// the batch, when fewer agents compete for the provider. Losing it would lose its vulnerability class.
-	const rerun = assignments.flatMap((assignment, index) => (outcomes[index]?.transient && !deps.signal?.aborted ? [{ assignment, index }] : []));
+	const rerun = assignments.flatMap((assignment, index) => (attempts[index]!.outcome.transient && !deps.signal?.aborted ? [{ assignment, index }] : []));
 	total += rerun.length;
 	if (rerun.length) deps.onProgress?.({ stage: "hunt", done, total });
-	const rerunResults = await mapBounded(rerun, deps.settings.maxConcurrentAgents, async ({ assignment, index }) => {
-		const first = outcomes[index]!;
-		const retry = await hunt(assignment, `hunt:${assignment.label} (re-run)`);
+	const retries = (await mapBounded(rerun, deps.settings.maxConcurrentAgents, ({ assignment }) => hunt(assignment, `hunt:${assignment.label} (re-run)`))).map(settled);
+	rerun.forEach(({ index }, i) => {
+		const first = attempts[index]!;
+		const retry = retries[i]!;
 		if (retry.outcome.ok) {
 			// The re-run is a complete attempt; keeping the partial one too would add near-duplicates.
-			perAssignment[index] = retry.hypotheses;
-			outcomes[index] = retry.outcome;
-			errors.push(`${first.label} was re-run after a transient error (${first.error})`);
+			attempts[index] = retry;
+			errors.push(`${first.outcome.label} was re-run after a transient error (${first.outcome.error})`);
 		} else {
-			perAssignment[index] = [...perAssignment[index]!, ...retry.hypotheses];
-			outcomes[index] = retry.outcome;
+			attempts[index] = { outcome: retry.outcome, hypotheses: [...first.hypotheses, ...retry.hypotheses] };
 		}
 	});
-	for (const result of rerunResults) if (result.status === "rejected") failures.push(thrown("hunt", result.reason));
-	for (const outcome of outcomes) if (outcome && !outcome.ok) failures.push(outcome);
+	const failures = attempts.filter((attempt) => !attempt.outcome.ok).map((attempt) => attempt.outcome);
 
 	// Partition order, not completion order, so ids are deterministic for the same submissions.
-	const merged = mergeDuplicateHypotheses(perAssignment.flat());
+	const merged = mergeDuplicateHypotheses(attempts.flatMap((attempt) => attempt.hypotheses));
 	const triage = await triageStage(profile, merged, deps, agents);
 	const { verify, overflow } = applyHypothesisCap(triage.candidates, deps.settings.maxHypotheses);
 	const withIds = [...verify, ...overflow].map(
@@ -357,7 +363,7 @@ export async function verifyHypothesis(
 
 	if (challenge.verdict === "refuted") return { kind: "refuted", hypothesis, refuted: { hypothesis, affirmer: affirm, challenger: challenge } };
 	const finding = await buildFinding(scope, hypothesis, affirm, challenge);
-	const errors = validate(FindingSchema, { ...finding, id: "SR-000", status: "open", first_seen: "-", last_seen: "-" });
+	const errors = validate(NewFindingSchema, finding);
 	if (errors.length > 0) return { kind: "invalid", hypothesis, reason: `${hypothesis.id}: finding failed validation: ${errors.join("; ")}` };
 	return { kind: "finding", hypothesis, finding };
 }
@@ -440,7 +446,7 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 	const run = {
 		id,
 		mode: scope.mode,
-		...(scope.baseRef ? { base_ref: scope.baseRef } : {}),
+		...(scope.mode === "diff" ? { base_ref: scope.baseRef } : {}),
 		started_at: started.toISOString(),
 		finished_at: finished.toISOString(),
 		files: scope.files.length,
@@ -451,7 +457,7 @@ export async function runPipeline(scope: Scope, deps: PipelineDeps): Promise<Run
 		errors,
 	};
 	const logDetails = {
-		scope: { mode: scope.mode, base_ref: scope.baseRef, merge_base: scope.mergeBase, files: scope.files },
+		scope: scope.mode === "diff" ? { mode: scope.mode, base_ref: scope.baseRef, merge_base: scope.mergeBase, files: scope.files } : { mode: scope.mode, files: scope.files },
 		profile: profileResult.profile,
 		profile_cached: profileResult.cached,
 		hypotheses: hunt.all,

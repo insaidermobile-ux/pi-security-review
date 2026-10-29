@@ -81,3 +81,8 @@ export const hang: FauxResponseFactory = (_context, options) =>
 		if (options?.signal?.aborted) done();
 		options?.signal?.addEventListener("abort", done, { once: true });
 	});
+
+/** Call a tool's execute directly, outside a session. */
+export function runTool<P, R>(tool: { execute(toolCallId: string, params: P, signal: undefined, onUpdate: undefined, ctx: never): Promise<R> }, params: P, toolCallId = "1"): Promise<R> {
+	return tool.execute(toolCallId, params, undefined, undefined, undefined as never);
+}

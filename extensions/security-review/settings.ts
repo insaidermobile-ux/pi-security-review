@@ -18,6 +18,8 @@ export interface SecurityReviewSettings {
 	agentTimeoutSeconds: number;
 }
 
+type NumericSetting = "maxConcurrentAgents" | "maxHypotheses" | "agentTimeoutSeconds";
+
 export const DEFAULT_SETTINGS: SecurityReviewSettings = {
 	models: {},
 	exclude: [],
@@ -67,9 +69,9 @@ function mergeLayers(layers: unknown[], errors: string[]): Layer {
 	return merged;
 }
 
-function positiveInteger(merged: Layer, key: keyof SecurityReviewSettings, errors: string[]): number {
+function positiveInteger(merged: Layer, key: NumericSetting, errors: string[]): number {
 	const value = merged[key];
-	const fallback = DEFAULT_SETTINGS[key] as number;
+	const fallback = DEFAULT_SETTINGS[key];
 	if (value === undefined) return fallback;
 	if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
 		errors.push(`${SETTINGS_KEY}.${key}: expected a positive integer, got ${describe(value)}`);

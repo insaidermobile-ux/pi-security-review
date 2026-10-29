@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { fingerprint, formatTitle, normalizeSink, normalizeVulnType } from "../extensions/security-review/fingerprint.ts";
 import { AffirmArgument, ChallengeArgument, Finding, HypothesisInput, ProfileInput, StoreFile, validate } from "../extensions/security-review/schema.ts";
-import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
+import { affirm, challenge, finding as sharedFinding, hypothesisInput } from "./fixtures.ts";
 
 describe("schemas", () => {
 	test("accepts a complete hypothesis", () => {
@@ -52,24 +52,7 @@ describe("schemas", () => {
 });
 
 describe("consequences on findings", () => {
-	const finding = {
-		id: "SR-001",
-		fingerprint: "abc",
-		title: "User search endpoint: sql injection leading to data exposure",
-		finding_class: "vulnerability",
-		vuln_type: "sql-injection",
-		severity: "high",
-		confidence: "high",
-		anchors: [{ file: "src/users.js", line: 6 }],
-		data_flow: affirm("H-001").attack_path,
-		description: affirm("H-001").description,
-		verification: { affirmer: affirm("H-001"), challenger: challenge("H-001", "confirmed"), verdict: "confirmed" },
-		remediation: affirm("H-001").remediation,
-		scope: "diff",
-		status: "open",
-		first_seen: "t1",
-		last_seen: "t1",
-	};
+	const finding = sharedFinding();
 	const consequence = { vuln_type: "secret-disclosure", description: "Session digests are readable through the injection", anchors: [{ file: "src/users.js", line: 6 }] };
 
 	test("validates findings with and without consequences", () => {

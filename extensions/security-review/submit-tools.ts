@@ -1,10 +1,9 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { type Static, type TSchema, Type } from "typebox";
 import { normalizePath } from "./fingerprint.ts";
 import { isInsideProject } from "./read-tools.ts";
-import { hasControlChars } from "./report.ts";
 import {
 	type AffirmArgument,
 	AffirmArgument as AffirmArgumentSchema,
@@ -21,6 +20,7 @@ import {
 	type TriageInput,
 	TriageInput as TriageInputSchema,
 } from "./schema.ts";
+import { hasControlChars } from "./text.ts";
 
 const Receipt = Type.Object({ recorded: Type.Boolean(), message: Type.String() });
 
@@ -101,34 +101,58 @@ function checkHypothesisId(expected: string, actual: string): void {
 	if (actual !== expected) throw new Error(`hypothesis_id must be "${expected}", got "${actual}".`);
 }
 
-export function createAffirmTool(hypothesisId: string, collector: ArgumentCollector<AffirmArgument>): ToolDefinition {
+interface ArgumentToolText {
+	label: string;
+	description: string;
+	recorded: string;
+}
+
+/** The `submit_argument` tool of one verification role, bound to the hypothesis it argues. */
+function createArgumentTool<S extends TSchema>(
+	hypothesisId: string,
+	parameters: S,
+	text: ArgumentToolText,
+	collector: ArgumentCollector<Static<S>>,
+): ToolDefinition {
 	return defineTool({
 		name: "submit_argument",
-		label: "Submit affirmer argument",
-		description: `Submit your argument that hypothesis ${hypothesisId} is exploitable. Call exactly once.`,
-		parameters: AffirmArgumentSchema,
+		label: text.label,
+		description: text.description,
+		parameters,
 		outputSchema: Receipt,
 		async execute(_id, params) {
-			checkHypothesisId(hypothesisId, params.hypothesis_id);
+			// Both argument schemas require hypothesis_id.
+			checkHypothesisId(hypothesisId, (params as { hypothesis_id: string }).hypothesis_id);
 			collector.argument = params;
-			return receipt("Argument recorded. You are done.", true);
+			return receipt(text.recorded, true);
 		},
 	}) as unknown as ToolDefinition;
 }
 
-export function createChallengeTool(hypothesisId: string, collector: ArgumentCollector<ChallengeArgument>): ToolDefinition {
-	return defineTool({
-		name: "submit_argument",
-		label: "Submit challenger argument",
-		description: `Submit your challenge and verdict for hypothesis ${hypothesisId}. Call exactly once.`,
-		parameters: ChallengeArgumentSchema,
-		outputSchema: Receipt,
-		async execute(_id, params) {
-			checkHypothesisId(hypothesisId, params.hypothesis_id);
-			collector.argument = params;
-			return receipt("Verdict recorded. You are done.", true);
+export function createAffirmTool(hypothesisId: string, collector: ArgumentCollector<AffirmArgument>): ToolDefinition {
+	return createArgumentTool(
+		hypothesisId,
+		AffirmArgumentSchema,
+		{
+			label: "Submit affirmer argument",
+			description: `Submit your argument that hypothesis ${hypothesisId} is exploitable. Call exactly once.`,
+			recorded: "Argument recorded. You are done.",
 		},
-	}) as unknown as ToolDefinition;
+		collector,
+	);
+}
+
+export function createChallengeTool(hypothesisId: string, collector: ArgumentCollector<ChallengeArgument>): ToolDefinition {
+	return createArgumentTool(
+		hypothesisId,
+		ChallengeArgumentSchema,
+		{
+			label: "Submit challenger argument",
+			description: `Submit your challenge and verdict for hypothesis ${hypothesisId}. Call exactly once.`,
+			recorded: "Verdict recorded. You are done.",
+		},
+		collector,
+	);
 }
 
 export type TriageGroup = TriageInput["groups"][number];

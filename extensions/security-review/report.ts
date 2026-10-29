@@ -1,29 +1,14 @@
 import type { Finding, RefutedHypothesis, RunRecord, Severity } from "./schema.ts";
 import { SEVERITIES } from "./schema.ts";
-import type { Scope } from "./scope.ts";
+import type { DiffScope, FullScope } from "./scope.ts";
 import { staleMarkingSkipped } from "./store.ts";
+import { fence, plural, stripControl } from "./text.ts";
 
 export const STALE_SKIPPED_NOTE = "Stale marking skipped: the run was incomplete.";
 
-/** C0 and C1 control characters other than tab and newline: a terminal reads them as escape sequences. */
-const CONTROL_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
-
-export function hasControlChars(text: string): boolean {
-	return text.search(CONTROL_CHARS) >= 0;
-}
-
-/**
- * Text that agents wrote or quoted from the audited repository, with control characters made visible.
- * Shown in a terminal (or a report printed in one), an escape sequence could write the clipboard, plant
- * a hidden link, or overwrite other parts of the output.
- */
-export function stripControl(text: string): string {
-	return text.replace(/\r\n/g, "\n").replace(CONTROL_CHARS, "\uFFFD");
-}
-
 export interface ReportInput {
 	run: RunRecord;
-	scope: Pick<Scope, "mode" | "baseRef" | "mergeBase">;
+	scope: Pick<FullScope, "mode"> | Pick<DiffScope, "mode" | "baseRef" | "mergeBase">;
 	findings: Finding[];
 	refuted: RefutedHypothesis[];
 	unverified: RunRecord["unverified"];
@@ -44,13 +29,6 @@ function anchorText(anchor: Finding["anchors"][number]): string {
 
 function consequenceLines(consequences: Finding["consequences"]): string[] {
 	return (consequences ?? []).map((c) => `- ${c.vuln_type} at ${c.anchors.map(anchorText).join(", ")}: ${c.description}`);
-}
-
-/** A code fence longer than any backtick run in `text`, so no line of the text can close it. */
-export function fence(text: string, language = ""): string {
-	const longest = Math.max(2, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
-	const ticks = "`".repeat(longest + 1);
-	return `${ticks}${language}\n${text.trimEnd()}\n${ticks}`;
 }
 
 function renderFinding(finding: Finding): string {
@@ -106,10 +84,6 @@ function renderFinding(finding: Finding): string {
 	return lines.join("\n");
 }
 
-export function plural(count: number, one: string, many = `${one}s`): string {
-	return `${count} ${count === 1 ? one : many}`;
-}
-
 /** Render the Markdown report for one run. */
 export function renderReport(input: ReportInput): string {
 	const { run, scope, findings } = input;
@@ -119,7 +93,7 @@ export function renderReport(input: ReportInput): string {
 		"# Security review report",
 		"",
 		`- Run: \`${run.id}\` (${run.started_at} to ${run.finished_at})`,
-		`- Scope: ${scope.mode === "diff" ? `changes against \`${scope.baseRef}\` (merge-base \`${scope.mergeBase?.slice(0, 12)}\`)` : "full project"}, ${run.files} files`,
+		`- Scope: ${scope.mode === "diff" ? `changes against \`${scope.baseRef}\` (merge-base \`${scope.mergeBase.slice(0, 12)}\`)` : "full project"}, ${run.files} files`,
 		`- Result: ${plural(vulnerabilities, "vulnerability", "vulnerabilities")}, ${plural(findings.length - vulnerabilities, "risk")}, ${input.refuted.length} refuted, ${input.unverified.length} unverified`,
 		`- By severity: ${SEVERITIES.map((s) => `${counts[s]} ${s}`).join(", ")}`,
 	];

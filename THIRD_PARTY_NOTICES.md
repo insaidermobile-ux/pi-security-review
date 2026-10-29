@@ -6,7 +6,7 @@ Parts of this package are adapted from [security-audit-skill](https://github.com
 
 - `roles/domains/*.md`: the domain guidance, adapted from the skill's domain files (each file names its source).
 - `roles/severity.md`: the severity definitions, adapted from the skill's severity calibration.
-- The focus text of the `access-control`, `injection`, `logic-concurrency`, `feature-abuse`, and `wildcard` vulnerability classes in `extensions/security-review/prompts.ts`, adapted from the skill's `ATTACK-CLASSES.md`.
+- The focus text of the `access-control`, `injection`, `logic-concurrency`, `feature-abuse`, and `wildcard` vulnerability classes in `extensions/security-review/partition.ts`, adapted from the skill's `ATTACK-CLASSES.md`.
 
 The skill is distributed under the following license:
 

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFil
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import { fingerprint } from "../extensions/security-review/fingerprint.ts";
-import type { Finding, Profile, RunRecord, ScopeMode } from "../extensions/security-review/schema.ts";
+import type { Finding, NewFinding, Profile, RunRecord, ScopeMode } from "../extensions/security-review/schema.ts";
 import {
 	assertStoreTrusted,
 	emptyStore,
@@ -12,7 +12,6 @@ import {
 	loadCachedProfile,
 	loadStore,
 	mergeRun,
-	type NewFinding,
 	matchKey,
 	matchStored,
 	priorFalsePositives,
@@ -23,29 +22,14 @@ import {
 	storePath,
 	writeRunLog,
 } from "../extensions/security-review/store.ts";
-import { affirm, challenge, hypothesisInput } from "./fixtures.ts";
+import { affirm, challenge, hypothesisInput, newFinding as sharedNewFinding } from "./fixtures.ts";
 import { commitAll, makeRepo, sh, write } from "./git-fixtures.ts";
 import { tempDir } from "./temp.ts";
 
 function newFinding(overrides: Partial<NewFinding> & { function?: string; line?: number } = {}): NewFinding {
 	const { function: fn = "searchUsers", line = 12, ...rest } = overrides;
 	const anchors = [{ file: "src/users.ts", line, function: fn }];
-	const h = hypothesisInput({ anchors });
-	return {
-		fingerprint: fingerprint(h),
-		title: "User search endpoint: sql injection leading to data exposure",
-		finding_class: "vulnerability",
-		vuln_type: h.vuln_type,
-		severity: "high",
-		confidence: "high",
-		anchors,
-		data_flow: affirm("H-001").attack_path,
-		description: affirm("H-001").description,
-		verification: { affirmer: affirm("H-001"), challenger: challenge("H-001", "confirmed"), verdict: "confirmed" },
-		remediation: affirm("H-001").remediation,
-		scope: "diff",
-		...rest,
-	};
+	return sharedNewFinding({ fingerprint: fingerprint(hypothesisInput({ anchors })), anchors, ...rest });
 }
 
 function run(mode: ScopeMode, id = "run-1"): Omit<RunRecord, "finding_ids"> {
@@ -283,12 +267,8 @@ describe("mergeRun fallback matching", () => {
 			now: "t1",
 		}).store;
 		(first.findings[0] as Finding & { note?: string }).note = "tracked in JIRA-1";
-		const incoming = newFinding();
-		delete incoming.cwe;
-		delete incoming.cvss_vector;
-		delete incoming.cvss_score;
-		delete incoming.introduced_in;
-		const second = mergeRun(first, { run: run("diff", "run-2"), findings: [incoming], now: "t2" }).store.findings[0]!;
+		// Observed again without CWE, CVSS, or introduced_in.
+		const second = mergeRun(first, { run: run("diff", "run-2"), findings: [newFinding()], now: "t2" }).store.findings[0]!;
 		for (const field of ["cwe", "cvss_vector", "cvss_score"]) assert.equal(field in second, false, field);
 		assert.equal(second.introduced_in, "abc123");
 		assert.equal((second as Finding & { note?: string }).note, "tracked in JIRA-1");

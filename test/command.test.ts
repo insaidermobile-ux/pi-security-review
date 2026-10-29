@@ -45,7 +45,7 @@ describe("status text", () => {
 function result(findings: Partial<Finding>[], overrides: Partial<RunResult> = {}): RunResult {
 	return {
 		run: { id: "r1", mode: "diff", started_at: "", finished_at: "", files: 2, complete: true, incomplete_reasons: [], finding_ids: [], refuted: [], unverified: [], errors: [] },
-		scope: { mode: "diff", root: "/repo", files: ["a.js", "b.js"], baseRef: "origin/main" },
+		scope: { mode: "diff", root: "/repo", files: ["a.js", "b.js"], baseRef: "origin/main", mergeBase: "0123456789abcdef", diff: "", diffTruncated: false, untracked: [] },
 		profileCached: false,
 		hypotheses: [],
 		findings: findings as Finding[],
