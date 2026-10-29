@@ -1,6 +1,6 @@
 {
   "name": "@insaidermobile-ux/pi-security-review",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Security review for pi. Read-only agents find vulnerabilities, separate agents challenge each attack path, and a findings store keeps results across runs.",
   "license": "MIT",
   "author": "insaidermobile-ux",

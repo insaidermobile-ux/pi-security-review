@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-29
+
+### Changed
+
+- Internal refactoring from a code review. No change to review behavior or output. Diff and full scopes are now separate types, and the finding schema is derived once and shared by the store and the pipeline.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added
